@@ -44,6 +44,61 @@ function fixMalformedDsml(raw) {
 }
 
 // =====================================================================
+// 0. 工具系统提示词按需注入（显式指令 "HI,TOOLS" 才发送一次庞大的工具系统提示词）
+//    语义：识别到指令 "HI,TOOLS" → **带上系统提示词发送 "HI" 消息**（发给网页
+//    模型的内容 = 系统提示词 + "HI"，仅这一次）；此后本会话一直不再带系统提示词
+//    发送；从未发送过 HI,TOOLS 的会话则一直不发送系统提示词。
+//    识别发生在指令当回合（调用方以 fire-and-forget 队列触发 CDP 键入，不阻塞
+//    "HI" 回复）；同一会话重复发 HI,TOOLS 只发 "HI"、不再带系统提示词（防膨胀）。
+//    注意：归属"当前会话"，依赖客户端稳定传入相同 session_id / 复用同一网页
+//    会话；换 session_id 或 new_session 新建会话后，需在新会话再发一次。
+// =====================================================================
+const TOOL_ARM_COMMAND = 'HI,TOOLS';
+
+// 已注入过系统提示词的会话集合：key 为 session_id 字符串，防同一会话重复注入。
+// 进程重启清空（本地开发桥可接受；如需跨重启可改外部存储）。
+const _promptInjectedSessions = new Set();
+
+// 标记某会话已注入过系统提示词
+function markPromptInjected(sessionId) {
+  if (sessionId !== undefined && sessionId !== null && sessionId !== '') {
+    _promptInjectedSessions.add(String(sessionId));
+  }
+}
+
+// 判断某会话是否已注入过系统提示词
+function isPromptInjected(sessionId) {
+  return _promptInjectedSessions.has(String(sessionId));
+}
+
+// 归一化：去除所有空白并转大写，便于稳定匹配 "HI,TOOLS" / "HI, TOOLS" 等变体
+function normalizeArmText(s) {
+  return String(s || '').replace(/\s+/g, '').toUpperCase();
+}
+
+// 只识别「最后一次用户消息」：客户端可能携带多轮会话历史（其中含以前的 HI,TOOLS 指令），
+// 不能因为历史里有 HI,TOOLS 就重复触发握手——只有最新一次用户指令才算数。
+function detectToolArm(messages) {
+  if (!Array.isArray(messages)) return false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.role === 'user' && typeof m.content === 'string') {
+      return normalizeArmText(m.content).includes(TOOL_ARM_COMMAND);
+    }
+  }
+  return false;
+}
+
+// 从用户内容中剥离 HI,TOOLS 控制指令（保留真实提问），避免把控制词键入网页模型
+function stripToolArm(content) {
+  if (typeof content !== 'string') return content;
+  return content
+    .replace(/HI\s*,\s*TOOLS/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// =====================================================================
 // 1. 构造注入到用户消息前的"工具说明"前缀
 //    toolChoice: 'auto'(默认) | 'none' | 'required' | {type:'function',function:{name:'x'}}
 // =====================================================================
@@ -557,6 +612,11 @@ module.exports = {
   TOOL_CALL_OPEN,
   fixMalformedDsml,
   TOOL_CALL_CLOSE,
+  TOOL_ARM_COMMAND,
+  detectToolArm,
+  stripToolArm,
+  markPromptInjected,
+  isPromptInjected,
   buildToolInstruction,
   formatToolBrief,
   parseToolOutput,
