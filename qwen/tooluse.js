@@ -56,28 +56,58 @@ function buildToolInstruction(tools, toolChoice) {
 }
 
 // 从模型回复中抽取工具调用。返回 null 或 [{name, arguments}]。
-// 容错：定界符之间可能带 ```json 围栏或多余空白；arguments 可是对象或字符串。
+// 容错（2026-08-21 修复：模型常把结尾定界符写成 __END 而非 __END__，或 JSON 带尾逗号/围栏/
+//   把 arguments 写成字符串，旧逻辑要求严格 __END__ 且 JSON.parse 一失败就丢弃，导致整段解析失败、
+//   原始 __TOOL_CALL__...__END 包装串泄漏到回复里）：
+//   1) 定界符前后下划线数量宽松匹配（__TOOL_CALL / __TOOL_CALL__ / __END / __END__ 都认）；
+//   2) 去掉 ```json 围栏与首尾空白；
+//   3) JSON 解析失败时尝试裁剪最外层 {} / 去除尾逗号后再次解析（salvageJSON）；
+//   4) arguments 若本身是 JSON 字符串，则解析为对象，便于上层统一处理。
 function extractToolCalls(content) {
   if (!content || typeof content !== 'string') return null;
-  const re = new RegExp(escapeRegExp(TOOL_CALL_OPEN) + '([\\s\\S]*?)' + escapeRegExp(TOOL_CALL_CLOSE), 'g');
+  // 定界符：允许尾部 0..2 个下划线（兼容模型漏写尾部下划线的情况）。
+  // 用 (?:_){0,2} 表示「0~2 个下划线」（注意不能写 __{0,2}，那会变成「至少 2 个」）。
+  // 上限取 2 而非贪婪 *_：多个工具调用相邻时（__END____TOOL_CALL__ 共 4 个下划线），
+  // 2+2 恰好拆分为「本调用结尾 2 个 + 下一调用开头 2 个」，避免结尾把下一调用开头的下划线吞掉。
+  const open = escapeRegExp(TOOL_CALL_OPEN).replace(/_+$/, '') + '(?:_){0,2}';
+  const close = escapeRegExp(TOOL_CALL_CLOSE).replace(/_+$/, '') + '(?:_){0,2}';
+  const re = new RegExp(open + '([\\s\\S]*?)' + close, 'g');
   const calls = [];
   let m;
   while ((m = re.exec(content)) !== null) {
     let raw = (m[1] || '').trim();
     // 去掉可能的代码围栏
-    raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
     if (!raw) continue;
-    try {
-      const obj = JSON.parse(raw);
-      if (obj && typeof obj.name === 'string' && obj.name) {
-        const args = obj.arguments != null ? obj.arguments : {};
-        calls.push({ name: obj.name, arguments: args });
+    const obj = salvageJSON(raw);
+    if (obj && typeof obj.name === 'string' && obj.name) {
+      let args = obj.arguments != null ? obj.arguments : {};
+      // arguments 若是 JSON 字符串，尝试解析为对象
+      if (typeof args === 'string') {
+        try { const pa = JSON.parse(args); args = pa; } catch (_) { /* 保留原字符串 */ }
       }
-    } catch (_) {
-      // 解析失败则该段忽略（视为普通文本）
+      calls.push({ name: obj.name, arguments: args });
     }
   }
   return calls.length ? calls : null;
+}
+
+// 尽力解析一段可能为 JSON 的文本：直接解析 → 裁剪最外层 {} → 去尾逗号重试
+function salvageJSON(raw) {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim();
+  // 1) 直接解析
+  try { return JSON.parse(s); } catch (_) {}
+  // 2) 取第一个 { 到最后一个 } 的子串
+  const a = s.indexOf('{');
+  const b = s.lastIndexOf('}');
+  if (a !== -1 && b > a) {
+    const sub = s.slice(a, b + 1);
+    try { return JSON.parse(sub); } catch (_) {}
+    // 3) 去除尾逗号（如 {"a":1,}）后重试
+    try { return JSON.parse(sub.replace(/,(\s*[}\]])/g, '$1')); } catch (_) {}
+  }
+  return null;
 }
 
 // 工具结果回传时，从 messages 中反查对应的工具名（用 tool_call_id 匹配 assistant 的 tool_calls）
