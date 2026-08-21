@@ -229,4 +229,116 @@ check('双 < 结束标签在流式筛分下也能正确闭合并产出 tool_call
   assert.strictEqual(gotToolCalls[0].function.name, 'ask_user_question');
 });
 
+// —— 按需注入控制：HI,TOOLS 会话级一次性注入 ——
+console.log('— 按需注入控制：HI,TOOLS 会话级一次性注入 —');
+
+check('detectToolArm: 用户消息含 HI,TOOLS 命中', () => {
+  assert.strictEqual(
+    t.detectToolArm([{ role: 'user', content: '北京天气？' }, { role: 'user', content: 'HI,TOOLS' }]),
+    true
+  );
+});
+
+check('detectToolArm: 变体 HI, TOOLS（含空格）也命中', () => {
+  assert.strictEqual(t.detectToolArm([{ role: 'user', content: 'hi, tools' }]), true);
+});
+
+check('detectToolArm: 无 HI,TOOLS 不命中', () => {
+  assert.strictEqual(t.detectToolArm([{ role: 'user', content: '北京天气？' }]), false);
+});
+
+check('detectToolArm: 非 user 角色不命中', () => {
+  assert.strictEqual(
+    t.detectToolArm([{ role: 'assistant', content: 'HI,TOOLS' }, { role: 'system', content: 'HI,TOOLS' }]),
+    false
+  );
+});
+
+check('detectToolArm: 只认最后一次用户消息——历史含旧 HI,TOOLS 不误触发', () => {
+  // 客户端带多轮历史：早期发过 HI,TOOLS，但最后一次用户消息是真实提问 → 不算握手
+  assert.strictEqual(
+    t.detectToolArm([
+      { role: 'user', content: 'HI,TOOLS' },
+      { role: 'assistant', content: '好的' },
+      { role: 'user', content: '北京天气怎么样？' },
+    ]),
+    false
+  );
+});
+
+check('detectToolArm: 只认最后一次用户消息——最后一次才是 HI,TOOLS 则命中', () => {
+  assert.strictEqual(
+    t.detectToolArm([
+      { role: 'user', content: '北京天气怎么样？' },
+      { role: 'assistant', content: '稍等' },
+      { role: 'user', content: 'HI,TOOLS' },
+    ]),
+    true
+  );
+});
+
+check('detectToolArm: 最后一次用户消息在 tool 结果回传之后仍能识别', () => {
+  // 模拟上一轮工具结果回传后，新回合用户消息是 HI,TOOLS
+  assert.strictEqual(
+    t.detectToolArm([
+      { role: 'user', content: '北京天气怎么样？' },
+      { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: '晴 25°C' },
+      { role: 'user', content: 'HI,TOOLS' },
+    ]),
+    true
+  );
+});
+
+check('detectToolArm: messages 非数组安全返回 false', () => {
+  assert.strictEqual(t.detectToolArm(null), false);
+  assert.strictEqual(t.detectToolArm(undefined), false);
+});
+
+check('stripToolArm: 剥离 HI,TOOLS 保留真实提问', () => {
+  assert.strictEqual(t.stripToolArm('HI,TOOLS 北京天气怎么样？'), '北京天气怎么样？');
+});
+
+check('stripToolArm: 剥离带空格变体并规整空白', () => {
+  assert.strictEqual(t.stripToolArm('  HI , TOOLS   查一下上海 '), '查一下上海');
+});
+
+check('stripToolArm: 纯指令剥离后为空串', () => {
+  assert.strictEqual(t.stripToolArm('HI,TOOLS'), '');
+  assert.strictEqual(t.stripToolArm('hi, tools'), '');
+});
+
+// —— 会话级一次性系统提示词注入（HI,TOOLS → 注入一次并防重复）——
+console.log('— 会话级一次性注入（markPromptInjected / isPromptInjected / detectToolArm）—');
+
+check('detectToolArm 命中后标记注入 → 同会话重复 HI,TOOLS 不再注入', () => {
+  // 握手回合：识别到 HI,TOOLS → 调用方标记已注入
+  assert.strictEqual(t.detectToolArm([{ role: 'user', content: 'HI,TOOLS' }]), true);
+  assert.strictEqual(t.isPromptInjected('sess-A'), false);
+  t.markPromptInjected('sess-A');
+  assert.strictEqual(t.isPromptInjected('sess-A'), true);
+  // 同会话再次发 HI,TOOLS（或任何请求）→ 已注入，调用方跳过注入
+  assert.strictEqual(t.isPromptInjected('sess-A'), true);
+});
+
+check('未发过 HI,TOOLS 的会话从未注入', () => {
+  assert.strictEqual(t.detectToolArm([{ role: 'user', content: '北京天气？' }]), false);
+  assert.strictEqual(t.isPromptInjected('sess-B'), false);
+});
+
+check('markPromptInjected: 空/缺省 session_id 不写入（防污染）', () => {
+  t.markPromptInjected('');
+  t.markPromptInjected(null);
+  t.markPromptInjected(undefined);
+  assert.strictEqual(t.isPromptInjected(''), false);
+  assert.strictEqual(t.isPromptInjected('null'), false);
+  assert.strictEqual(t.isPromptInjected('undefined'), false);
+});
+
+check('markPromptInjected: 不同 session_id 互不影响（一次注入只归属一个会话）', () => {
+  t.markPromptInjected('sess-D');
+  assert.strictEqual(t.isPromptInjected('sess-D'), true);
+  assert.strictEqual(t.isPromptInjected('sess-E'), false);
+});
+
 console.log(`\n通过 ${passed} 项断言。`);

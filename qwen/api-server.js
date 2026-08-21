@@ -112,7 +112,42 @@ async function handleCompletions(req, res) {
     return sendOpenAIError(res, 400, 'invalid_request_error', 'messages 必须是非空数组', 'invalid_messages');
   }
 
-  // —— 工具调用模式：tools 非空 → 启用基于提示词的工具层 ——
+  // 会话 id：优先用客户端显式传入的 session_id（用于会话切换检测 / 系统提示词注入归属），否则服务端生成
+  const hasClientSessionId = typeof body.session_id === 'string' && body.session_id.length > 0;
+  const sessionId = hasClientSessionId ? body.session_id : genSessionId();
+  // 先做新建会话决策并记录，确保握手回合与后续回合归属同一网页会话（注入的提示词才能留在历史里）
+  const newSession = decideNewSession(hasClientSessionId ? sessionId : null, body.new_session);
+  if (hasClientSessionId) lastSessionId = sessionId;
+
+  // —— 工具系统提示词按需注入（HI,TOOLS 会话级一次性）——
+  // 识别到指令 "HI,TOOLS" → **带上系统提示词发送 "HI" 消息**（发给网页模型的内容 =
+  // 系统提示词 + "HI"，一次）；此后本会话一直不再带系统提示词发送。
+  // 未发过该指令的会话则一直不发送系统提示词。
+  // 握手走后台队列 fire-and-forget（不阻塞 "HI" 回复）；同一会话重复 HI,TOOLS 只发 "HI" 不带提示词。
+  if (tooluse.detectToolArm(messages)) {
+    const toolsOk = Array.isArray(tools) && tools.length > 0 && tool_choice !== 'none';
+    const firstTime = !tooluse.isPromptInjected(sessionId);
+    let handshake;
+    if (toolsOk && firstTime) {
+      tooluse.markPromptInjected(sessionId);
+      const instruction = tooluse.buildToolInstruction(tools, tool_choice);
+      handshake = instruction ? `${instruction}\n\nHI` : 'HI';
+    } else {
+      handshake = 'HI'; // 同会话重复 HI,TOOLS：仅发 "HI"，不再带系统提示词
+    }
+    enqueue(async () => {
+      try {
+        await cdp.executeChat(sessionId, handshake, { newSession, model: route.requested });
+        console.log(`[api] HI,TOOLS 握手已发送会话 ${sessionId}：${handshake === 'HI' ? '仅 HI（无系统提示词）' : `系统提示词(1次)+HI，工具 ${tools.length} 个`}`);
+      } catch (e) {
+        console.warn('[api] HI,TOOLS 握手发送失败:', e.message);
+      }
+    });
+    return sendToolArmAck(res, modelOut, sessionId, stream);
+  }
+
+  // 工具调用模式：tools 非空。注意：**这里不再注入**工具系统提示词——它只在
+  // HI,TOOLS 回合注入过一次（留在网页会话历史中）；未发过 HI,TOOLS 的会话按普通问答处理。
   const toolMode = Array.isArray(tools) && tools.length > 0;
 
   // 计算要键入页面的文本（outgoing）
@@ -133,9 +168,6 @@ async function handleCompletions(req, res) {
       }
       outgoing = u.content;
     }
-    // 注入工具说明前缀（tool_choice==='none' 时不注入，纯问答）
-    const instruction = tool_choice === 'none' ? '' : tooluse.buildToolInstruction(tools, tool_choice);
-    outgoing = instruction ? instruction + '\n\n' + outgoing : outgoing;
   } else {
     // 取最后一条 user 消息作为发送内容（system 等角色会被忽略——网页版有自身预设）
     const lastUser = [...messages].reverse().find((m) => m && (m.role === 'user' || m.content));
@@ -145,11 +177,6 @@ async function handleCompletions(req, res) {
     outgoing = lastUser.content;
   }
 
-  // 会话 id：优先用客户端显式传入的 session_id（用于会话切换检测），否则服务端生成
-  const hasClientSessionId = typeof body.session_id === 'string' && body.session_id.length > 0;
-  const sessionId = hasClientSessionId ? body.session_id : genSessionId();
-  const newSession = decideNewSession(hasClientSessionId ? sessionId : null, body.new_session);
-  if (hasClientSessionId) lastSessionId = sessionId; // 记录本次会话 id（无论是否新建）
   const opts = { newSession, model: route.requested }; // 透传原始请求型号名，供后端按名称关键词（thinking/search）尽力切换网页模式
 
   console.log(
@@ -215,6 +242,36 @@ function buildCompletion(model, sessionId, prompt, content) {
       total_tokens: Math.max(2, Math.ceil((prompt.length + content.length) / 1.5)),
     },
   };
+}
+
+// 工具启用指令 HI,TOOLS 的确认响应：桥接层会把「系统提示词 + HI」发送给网页模型，
+// 这里仅回一个 OpenAI 标准完成（或 SSE），正文为 "HI"。
+function sendToolArmAck(res, model, sessionId, stream) {
+  const ack = 'HI';
+  if (stream) {
+    const created = Math.floor(Date.now() / 1000);
+    const chatId = `chatcmpl-${sessionId}`;
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.write(
+      `data: ${JSON.stringify({
+        id: chatId, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: { role: 'assistant', content: ack }, finish_reason: null }],
+      })}\n\n`
+    );
+    res.write(
+      `data: ${JSON.stringify({
+        id: chatId, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      })}\n\n`
+    );
+    res.write('data: [DONE]\n\n');
+    return res.end();
+  }
+  return res.json(buildCompletion(model, sessionId, '', ack));
 }
 
 // —— 工具调用（tool_calls）相关构造 ——

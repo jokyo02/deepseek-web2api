@@ -174,16 +174,35 @@ data: [DONE]
 
 ### 3.6 工具调用（Tool Use / Function Calling）
 
-Qwen **网页版没有对外的 function-calling 协议**，本桥靠"键入文本 + 读回回复"驱动模型。为支持 OpenAI 的 `tools`/`tool_calls`，本服务用一套**约定格式**让网页模型"假装"支持工具调用（见 `tooluse.js`）：
+Qwen **网页版没有对外的原生 function-calling 协议**（不同于官方 `dashscope` API），本桥靠"键入文本 + 读回回复"驱动模型。为支持 OpenAI 的 `tools`/`tool_calls`，本服务用一套**约定格式（DSML，DeepSeek Markup Language，源自 deepseek-web2api-free）**让网页模型"假装"支持工具调用（见 `tooluse.js`）：
 
-1. 请求带 `tools` 时，把**工具清单 + 调用规则**作为前缀注入到用户消息里；
-2. 捕获回复，用定界符 `__TOOL_CALL__{"name":...,"arguments":{...}}__END__` 抽取工具调用；
-3. 转成 OpenAI 标准 `tool_calls` 返回（`finish_reason: "tool_calls"`，`content: null`）；
+1. 请求带 `tools` 时，把**工具清单 + 调用规则**作为前缀注入到用户消息里（`buildToolInstruction`）；
+2. 捕获回复，用 DSML 标签 `<|DSML|tool_calls>` → `<|DSML|invoke name="…">` → `<|DSML|parameter name="…"><![CDATA[…]]></|DSML|parameter>` 抽取工具调用；字符串参数值放在 `<![CDATA[…]]>` 中，天然免疫引号/花括号/换行破坏；
+3. 转成 OpenAI 标准 `tool_calls` 返回（`finish_reason: "tool_calls"`）；
 4. 客户端执行工具后，把 `role: "tool"` 的结果发回，桥接层把结果**键入页面**续聊。
 
+**关键增强（与 deepseek-cdp-bridge 同构）**：
+- **content 与 tool_calls 不再互斥**：模型"先说一句 + 再调工具"时，正文与工具调用同时返回（旧方案会丢弃正文）。
+- **流式场景**：`ToolStreamSieve` 逐字符分离正文与工具调用，正文实时吐出、工具调用块闭合后才 flush。
+- **容错**：模型偶发把结束标签写成 `</<|DSML|parameter>`（多了一个 `<`）时，解析器先归一化为规范的 `</|DSML|parameter>` 再解析，避免整段 DSML 泄漏为原样正文。
+- **向后兼容**：旧版 `__TOOL_CALL__{"name":…,"arguments":{…}}__END__` 定界符仍可被解析（保留下划线宽松、尾逗号、字符串化 arguments 等容错），仅解析兼容，注入格式已统一切换为 DSML。
+
 **注意事项**：
-- 这是**基于提示词的尽力而为方案**：可靠性取决于网页模型对 `__TOOL_CALL__…__END__` 格式的遵循度。
+- 这是**基于提示词的尽力而为方案**：可靠性取决于网页模型对 DSML 格式的遵循度；模型偶尔可能输出多余文字或漏掉格式，此时会按普通回答处理（不触发 `tool_calls`）。
 - 注入的工具说明前缀会**出现在 Qwen 网页对话里**，属该方案的固有代价。
+
+### 3.7 工具提示词按需注入：`HI,TOOLS` 会话级一次性注入（省 prompt）
+
+由于上层 agent 每次请求都携带 `tools`，若每轮都把庞大的工具说明前缀注入网页模型，对话上下文与 token 成本会显著膨胀。本桥改为**只在识别到指令 `HI,TOOLS` 时，带上系统提示词发送一次 `HI` 消息**：
+
+- **默认一直不发送**：会话从未发送过 `HI,TOOLS` 时，即使请求带 `tools`，桥接层也**不发送**工具系统提示词，网页模型按普通问答处理（不会触发 `tool_calls`）。
+- **识别到即带提示词发 `HI`**：请求中的 user 消息含 `HI,TOOLS`（大小写/空格宽松匹配，如 `HI, TOOLS`）时，桥接层把**系统提示词 + `HI` 消息**作为发给网页模型的内容（`系统提示词\n\nHI`），**仅这一次**；同时回正文 `HI`。
+- **握手为后台执行，回 `HI` 不等待**：握手消息走串行队列 fire-and-forget，`HI` 立即返回（JSON 或 SSE）。
+- **同会话不再带提示词**：本会话（同一 `session_id`）后续所有请求（含再次发 `HI,TOOLS`）都**不再带系统提示词**——再次发 `HI,TOOLS` 只发 `HI`。系统提示词留在网页会话历史中，后续带 `tools` 的请求直接发真实提问，模型依据历史中的提示词产生 `tool_calls`。
+
+- **识别条件=最后一次用户消息**：客户端常携带多轮历史（其中含以前的 `HI,TOOLS` 指令），桥接层**只识别最后一次用户消息**——历史里的旧 `HI,TOOLS` 不会触发握手，只有最新一次用户指令是 `HI,TOOLS` 才算。
+
+> 依赖：握手归属"当前会话"——请用**相同 `session_id`** 复用在同一网页会话；若换 `session_id` 或 `new_session` 新建会话，新会话历史中没有提示词，需要在新会话里再发一次 `HI,TOOLS`（带 `tools`）。`HI,TOOLS` 应作为独立回合发送（带 `tools` 参数），若与真实提问混在同一回合，该回合会被当作握手处理、提问不转发。进程重启后注入状态清空。
 
 ---
 
@@ -318,7 +337,7 @@ data: {"choices":[{"delta":{"content":"","role":"assistant","status":"finished",
 |---|---|
 | `api-server.js` | API 服务器：OpenAI 兼容端点 + 模型路由校验 + 串行队列 + 错误处理 |
 | `models.js` | 模型路由注册表：内置 `qwen-web` + 常用别名映射 + `/v1/models` 列表（改模型只动这里） |
-| `tooluse.js` | 工具调用层：把 OpenAI `tools` 转为提示词约定、抽取 `__TOOL_CALL__…__END__` |
+| `tooluse.js` | 工具调用层（DSML）：把 OpenAI `tools` 转为 DSML 提示词注入、抽取 `<|DSML|…>` 工具调用（含 CDATA 参数解析/自动类型）、`ToolStreamSieve` 流筛分引擎、旧 `__TOOL_CALL__` 向后兼容、反查工具名 |
 | `cdp-controller.js` | CDP 控制器：连接页面、一次性写入文本 + 发送、按模型切换网页模式、SSE 捕获 + DOM 兜底 |
 | `_sse_selftest.js` | SSE 解析器离线自测（`npm run selftest`），覆盖增量/快照/思考排除/结束检测 |
 | `_debug_page.js` | 页面结构探测工具：页面改版后重新确认选择器 |
