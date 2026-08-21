@@ -51,19 +51,34 @@ function sendOpenAIError(res, status, type, message, code) {
   return res.status(status).json({ error: { message, type, code: code || 'error' } });
 }
 
-// —— 会话跟踪：检测客户端切换会话 ——
-// OpenAI 兼容客户端"新建会话"时会给新会话分配新的会话 id（session_id）。
-// 服务器记住上次使用的 session_id：新请求的 id 与上次不同 → 判定客户端开了新会话 → 自动新建页面会话。
-// 仅对客户端显式传入的 session_id 生效（未传时由服务端生成随机 id，不触发自动新建，保持向后兼容）。
-let lastSessionId = null;
-
-// 决策是否新建会话。bodySessionId 为客户端显式传入的会话 id（无则 null）。
+// —— 会话控制：只有显式字段或 NEW.TOPIC 指令才新建会话 ——
+// 2026-08-21 调整：**取消"客户端换 session_id 即自动新建页面会话"**（原自动检测已移除）。
+// 理由：OpenAI 兼容客户端（OpenWebUI / DSH 等）点"新会话"时天然会换 session_id，
+// 若每次切换都自动开新网页会话，网页侧会堆积大量空会话并丢失上下文。
+// 现在新建会话只有两种途径：
+//   1. 显式字段：请求体 `new_session: true`；
+//   2. 控制指令：最后一条用户消息内容为 "NEW.TOPIC"（大小写/空白/点号宽松匹配）。
 // explicit 为请求体里的 new_session 字段（undefined 表示未声明）。
-function decideNewSession(bodySessionId, explicit) {
-  if (explicit === true) return true;  // 显式强制新建
-  if (explicit === false) return false; // 显式禁止新建
-  if (bodySessionId == null) return false; // 客户端未传 id，无法判断，维持当前会话
-  if (lastSessionId !== null && bodySessionId !== lastSessionId) return true; // 检测到会话切换
+function decideNewSession(explicit) {
+  return explicit === true; // 仅显式强制新建；默认一律不自动新建
+}
+
+// —— NEW.TOPIC 控制指令 ——
+// 归一化：去除所有空白与点号并转大写，稳定匹配 "NEW.TOPIC" / "new topic" / "NEW TOPIC" 等变体
+function normalizeTopicText(s) {
+  return String(s || '').replace(/\s+/g, '').replace(/\./g, '').toUpperCase();
+}
+
+// 检测最后一条用户消息是否就是 NEW.TOPIC 控制指令（独立回合，不转发给网页模型）。
+// 只识别「最后一次用户消息」：历史里的旧 NEW.TOPIC 不触发，与 HI,TOOLS 的识别规则一致。
+function isNewTopicCommand(messages) {
+  if (!Array.isArray(messages)) return false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.role === 'user' && typeof m.content === 'string') {
+      return normalizeTopicText(m.content) === 'NEWTOPIC';
+    }
+  }
   return false;
 }
 
@@ -112,19 +127,47 @@ async function handleCompletions(req, res) {
     return sendOpenAIError(res, 400, 'invalid_request_error', 'messages 必须是非空数组', 'invalid_messages');
   }
 
-  // 会话 id：优先用客户端显式传入的 session_id（用于会话切换检测 / 系统提示词注入归属），否则服务端生成
+  // —— WorkBuddy 专有格式解析（2026-08-21）——
+  // WorkBuddy 客户端在 user 消息中总是附带系统提示词，真实用户消息由 <user_query>...</user_query>
+  // 标签包裹。除 HI,TOOLS 指令回合（注入工具系统提示词）外，其余情况**只把 <user_query> 内的
+  // 真实消息传给网页模型**（不带客户端附加的系统提示词、不带标签本身）；特殊指令
+  // （NEW.TOPIC / HI,TOOLS）也优先在提取后的真实消息上解析。无标签的普通客户端不受影响。
+  const cleanMessages = messages.map((m) => {
+    if (m && m.role === 'user' && typeof m.content === 'string') {
+      return { ...m, content: tooluse.extractUserQuery(m.content) };
+    }
+    return m;
+  });
+
+  // 会话 id：优先用客户端显式传入的 session_id（用于系统提示词注入归属），否则服务端生成
   const hasClientSessionId = typeof body.session_id === 'string' && body.session_id.length > 0;
   const sessionId = hasClientSessionId ? body.session_id : genSessionId();
-  // 先做新建会话决策并记录，确保握手回合与后续回合归属同一网页会话（注入的提示词才能留在历史里）
-  const newSession = decideNewSession(hasClientSessionId ? sessionId : null, body.new_session);
-  if (hasClientSessionId) lastSessionId = sessionId;
+  // 新建会话决策：仅显式 new_session 字段触发（session_id 变化自动检测已取消，见 decideNewSession）
+  const newSession = decideNewSession(body.new_session);
+
+  // —— NEW.TOPIC 控制指令：独立回合新建会话（不转发给网页模型）——
+  // 识别到即入队新建会话（fire-and-forget，立即回 NEW.TOPIC 确认）；下一条消息在队列中排在新建之后，
+  // 天然落在新会话里，无需客户端等待。与 HI,TOOLS 握手机制同模式。
+  if (isNewTopicCommand(cleanMessages)) {
+    enqueue(async () => {
+      try {
+        await cdp.newSession();
+        console.log(`[api] NEW.TOPIC 指令：已新建网页会话（sessionId=${sessionId}）`);
+      } catch (e) {
+        console.warn(`[api] NEW.TOPIC 新建会话失败: ${e.message}`);
+      }
+    });
+    return sendNewTopicAck(res, modelOut, sessionId, stream);
+  }
 
   // —— 工具系统提示词按需注入（HI,TOOLS 会话级一次性）——
-  // 识别到指令 "HI,TOOLS" → **带上系统提示词发送 "HI" 消息**（发给网页模型的内容 =
-  // 系统提示词 + "HI"，一次）；此后本会话一直不再带系统提示词发送。
-  // 未发过该指令的会话则一直不发送系统提示词。
-  // 握手走后台队列 fire-and-forget（不阻塞 "HI" 回复）；同一会话重复 HI,TOOLS 只发 "HI" 不带提示词。
-  if (tooluse.detectToolArm(messages)) {
+  // 识别到指令 "HI,TOOLS" → **向网页发送 "HI" 消息代替客户端的 "HI,TOOLS" 文本**：
+  // 首次（带 tools）时把系统提示词一并附在 "HI" 前发给网页（系统提示词 + "HI"），
+  // 此后本会话一直不再带系统提示词发送；未发过该指令的会话则一直不发送系统提示词。
+  // 2026-08-21 调整：该回合**不再由服务器伪造 "HI" ACK 返回客户端**，而是把 "HI"
+  // （含系统提示词）真正发给网页，并将**网页的真实回复**返回给客户端（流式按增量推送）——
+  // 指令本身只负责触发系统提示词添加。同一会话重复 HI,TOOLS 只发 "HI" 不带提示词。
+  if (tooluse.detectToolArm(cleanMessages)) {
     const toolsOk = Array.isArray(tools) && tools.length > 0 && tool_choice !== 'none';
     const firstTime = !tooluse.isPromptInjected(sessionId);
     let handshake;
@@ -135,15 +178,28 @@ async function handleCompletions(req, res) {
     } else {
       handshake = 'HI'; // 同会话重复 HI,TOOLS：仅发 "HI"，不再带系统提示词
     }
+    const handshakeOpts = { newSession, model: route.requested };
     enqueue(async () => {
       try {
-        await cdp.executeChat(sessionId, handshake, { newSession, model: route.requested });
-        console.log(`[api] HI,TOOLS 握手已发送会话 ${sessionId}：${handshake === 'HI' ? '仅 HI（无系统提示词）' : `系统提示词(1次)+HI，工具 ${tools.length} 个`}`);
-      } catch (e) {
-        console.warn('[api] HI,TOOLS 握手发送失败:', e.message);
+        if (stream) {
+          // 流式：把网页对 "HI" 的回复按 SSE 增量实时推给客户端
+          await handleStreaming(req, res, { model: modelOut, sessionId, message: handshake, opts: handshakeOpts });
+        } else {
+          const result = await cdp.executeChat(sessionId, handshake, handshakeOpts);
+          res.json(buildCompletion(modelOut, sessionId, handshake, result.content));
+        }
+        console.log(`[api] HI,TOOLS 已发给网页会话 ${sessionId}：${handshake === 'HI' ? '仅 HI（无系统提示词）' : `系统提示词(1次)+HI，工具 ${tools.length} 个`}，网页回复已返回客户端`);
+      } catch (err) {
+        console.error(`[api] HI,TOOLS 会话 ${sessionId} 失败: ${err.message}`);
+        if (res.headersSent) {
+          res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'server_error', code: 'cdp_error' } })}\n\n`);
+          res.end();
+        } else {
+          sendOpenAIError(res, 500, 'server_error', err.message, 'cdp_error');
+        }
       }
     });
-    return sendToolArmAck(res, modelOut, sessionId, stream);
+    return;
   }
 
   // 工具调用模式：tools 非空。注意：**这里不再注入**工具系统提示词——它只在
@@ -153,14 +209,14 @@ async function handleCompletions(req, res) {
   // 计算要键入页面的文本（outgoing）
   let outgoing;
   if (toolMode) {
-    const last = messages[messages.length - 1];
+    const last = cleanMessages[cleanMessages.length - 1];
     if (last && last.role === 'tool') {
       // 上一轮工具结果回传：标注后键入页面，供模型继续
-      const tname = tooluse.resolveToolName(messages, last.tool_call_id);
+      const tname = tooluse.resolveToolName(cleanMessages, last.tool_call_id);
       const tcontent = typeof last.content === 'string' ? last.content : JSON.stringify(last.content);
       outgoing = `【工具「${tname}」的返回结果如下，请据此继续完成任务】\n${tcontent}`;
     } else {
-      const u = [...messages].reverse().find(
+      const u = [...cleanMessages].reverse().find(
         (m) => m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()
       );
       if (!u) {
@@ -170,7 +226,7 @@ async function handleCompletions(req, res) {
     }
   } else {
     // 取最后一条 user 消息作为发送内容（system 等角色会被忽略——网页版有自身预设）
-    const lastUser = [...messages].reverse().find((m) => m && (m.role === 'user' || m.content));
+    const lastUser = [...cleanMessages].reverse().find((m) => m && (m.role === 'user' || m.content));
     if (!lastUser || typeof lastUser.content !== 'string' || !lastUser.content.trim()) {
       return sendOpenAIError(res, 400, 'invalid_request_error', 'messages 中缺少有效的 user 消息', 'missing_user_message');
     }
@@ -183,7 +239,7 @@ async function handleCompletions(req, res) {
     `[api] 收到请求(${stream ? 'stream' : 'json'}) sessionId=${sessionId}` +
     ` model=${modelOut}${route.isAlias ? '(别名)' : ''}${!route.isKnown ? '(未知→默认后端)' : ''}` +
     `${toolMode ? ` [tools:${tools.length}${tool_choice ? ',choice=' + JSON.stringify(tool_choice) : ''}]` : ''}` +
-    ` new_session=${newSession}${newSession && hasClientSessionId ? '（会话切换自动检测）' : ''}`
+    ` new_session=${newSession}`
   );
 
   enqueue(async () => {
@@ -244,10 +300,10 @@ function buildCompletion(model, sessionId, prompt, content) {
   };
 }
 
-// 工具启用指令 HI,TOOLS 的确认响应：桥接层会把「系统提示词 + HI」发送给网页模型，
-// 这里仅回一个 OpenAI 标准完成（或 SSE），正文为 "HI"。
-function sendToolArmAck(res, model, sessionId, stream) {
-  const ack = 'HI';
+// NEW.TOPIC 控制指令的确认响应：桥接层已入队新建网页会话（fire-and-forget），
+// 这里回一个 OpenAI 标准完成（或 SSE），正文回显 "NEW.TOPIC"，客户端据此确认指令已受理。
+function sendNewTopicAck(res, model, sessionId, stream) {
+  const ack = 'NEW.TOPIC';
   if (stream) {
     const created = Math.floor(Date.now() / 1000);
     const chatId = `chatcmpl-${sessionId}`;
@@ -514,13 +570,31 @@ app.post('/chat', (req, res) => {
   }
   const hasClientSessionId = typeof body.sessionId === 'string' && body.sessionId.length > 0;
   const sessionId = hasClientSessionId ? body.sessionId : genSessionId();
-  const newSession = decideNewSession(hasClientSessionId ? sessionId : null, body.newSession);
-  if (hasClientSessionId) lastSessionId = sessionId;
-  console.log(
-    `[api] 收到请求(legacy /chat) sessionId=${sessionId} newSession=${newSession}` +
-    `${newSession && hasClientSessionId ? '（会话切换自动检测）' : ''}`
-  );
-  enqueue(() => runChat(sessionId, message, res, { newSession }));
+  const newSession = decideNewSession(body.newSession);
+  // WorkBuddy 专有格式：只取 <user_query> 内的真实消息（指令检测与发送都用真实消息）
+  const realMessage = tooluse.extractUserQuery(message);
+  console.log(`[api] 收到请求(legacy /chat) sessionId=${sessionId} newSession=${newSession}`);
+
+  // NEW.TOPIC 控制指令：入队新建会话并回确认（不转发给网页模型）
+  if (normalizeTopicText(realMessage) === 'NEWTOPIC') {
+    enqueue(async () => {
+      try {
+        await cdp.newSession();
+        console.log(`[api] NEW.TOPIC 指令：已新建网页会话（sessionId=${sessionId}）`);
+      } catch (e) {
+        console.warn(`[api] NEW.TOPIC 新建会话失败: ${e.message}`);
+      }
+    });
+    return res.json({
+      success: true,
+      sessionId,
+      content: 'NEW.TOPIC',
+      newSession: true,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  enqueue(() => runChat(sessionId, realMessage, res, { newSession }));
 });
 
 async function runChat(sessionId, message, res, opts) {

@@ -22,6 +22,9 @@
 const CDP = require('chrome-remote-interface');
 
 const CDP_PORT = Number(process.env.CDP_PORT || 9222);
+// 显式 IPv4 回环地址：Chrome --remote-debugging-port 默认只监听 127.0.0.1（不含 IPv6），
+// 且新版 Node 解析 localhost 可能优先 ::1 导致连接被拒。可用 CDP_HOST 覆盖（如 127.0.0.1）。
+const CDP_HOST = process.env.CDP_HOST || '127.0.0.1';
 const RESPONSE_TIMEOUT = Number(process.env.RESPONSE_TIMEOUT || 60000);
 const STABLE_MS = Number(process.env.STABLE_MS || 3000); // DOM 兜底时的静默稳定窗口
 const QWEN_URL_MATCH = /qwen\.ai/;                        // 匹配 chat.qwen.ai（chat.qwen.com 会跳转过来）
@@ -92,7 +95,9 @@ class CDPController {
   async connect() {
     let targets;
     try {
-      targets = await CDP.List({ port: CDP_PORT });
+      // 显式用 IPv4 回环地址：Chrome --remote-debugging-port 默认只监听 127.0.0.1，
+      // 而新版 Node 解析 localhost 时可能优先 ::1（IPv6）导致 ECONNREFUSED。
+      targets = await CDP.List({ host: CDP_HOST, port: CDP_PORT });
     } catch (e) {
       throw new Error(
         `无法连接 Chrome 调试端口 ${CDP_PORT}：${e.message}。请确认 Chrome 已用 --remote-debugging-port=${CDP_PORT} 启动`
@@ -105,7 +110,7 @@ class CDPController {
       throw new Error(`未找到 Qwen 页面。请先在 Chrome 中打开并登录 https://chat.qwen.ai。当前页面：${pages}`);
     }
 
-    this.client = await CDP({ target: page, port: CDP_PORT });
+    this.client = await CDP({ target: page, host: CDP_HOST, port: CDP_PORT });
     const { Network, Page, Runtime, DOM } = this.client;
 
     await Promise.all([Network.enable(), Page.enable(), Runtime.enable(), DOM.enable()]);
@@ -193,10 +198,11 @@ class CDPController {
 
     const url = await this.evalJS('location.href');
     const snap = await this.snapshotAssistant();
-    // 边界：页面停在根路径(URL 为 / 且无任何消息)时，直接发送会因会话未创建而丢失消息
+    // 2026-08-21 关键修复：**不再自动新建会话**——保持当前会话页面（用户硬性要求）。
+    // 页面停在根路径(URL 为 / 且无任何消息)时仅记录警告：此状态下直接发送可能因会话未创建而丢失消息，
+    // 如需新会话请通过 NEW.TOPIC 指令或 new_session:true 显式触发（见 api-server.js）。
     if (!opts.newSession && snap.count === 0 && /^https?:\/\/chat\.qwen\.ai\/?$/.test(url)) {
-      console.log('[cdp] 检测到根路径无会话，自动创建会话页后发送');
-      await this.newSession();
+      console.warn('[cdp] 警告：页面在根路径且无会话消息，直接发送可能丢失；如需新建会话请发送 NEW.TOPIC');
     }
 
     // 按模型名称尽力切换网页模式（深度思考 / 联网搜索）—— 失败不阻断发送
@@ -636,12 +642,15 @@ class CDPController {
     const t = String(text == null ? '' : text);
     if (!t) return; // 空消息无需写入
 
-    // —— 0a. 检测按钮卡死（sendDisabled=true 持续）→ 自动新建会话恢复 ——
-    // 触发场景（2026-08-21 现场事故）：
-    //   A) 工具调用模态对话框（taLen=0 + sendDisabled=true）：Qwen 弹 ask_user_question 等模态
-    //   B) React state 卡死（taLen>0 + sendDisabled=true）：长文本截断后按钮永远 disabled
-    //   C) 任何 sendDisabled=true 持续 1s 以上的状态（页面其它异常）
-    // 对所有情况，都主动 newSession（点击新建对话按钮）恢复新输入框 + 干净状态。
+    // —— 0a. 注入前健康检查：识别「输入框有内容但发送按钮禁用」的真卡死状态 ——
+    // 2026-08-21 关键修复：原实现把「空输入框 + 发送按钮 disabled」的正常状态误判为卡死
+    // （taLen=0 + sendDisabled=true 正是空输入框的常态！），导致每次请求都自动 newSession()，
+    // 网页会话被反复切换、无法保持原会话页面。
+    // 现改为：① 空输入框（taLen=0）的 disabled 是正常态，**绝不处理**；
+    //          ② 仅当「输入框有内容且按钮 disabled 持续 ≥800ms」才认为真卡死（React state 截断等），
+    //             先重发 input 事件强制 React 同步（与 triggerSend 的 stuck 恢复一致）；
+    //          ③ 仍失败则抛错提示人工处理——**不再自动新建会话**（新建仅由 api-server 层的
+    //             new_session 字段 / NEW.TOPIC 指令驱动）。
     const stuck0 = await this.evalJS(`(function () {
       var el = document.querySelector('[contenteditable="true"], textarea');
       if (!el) return { taLen: -1, sendDisabled: null };
@@ -653,27 +662,40 @@ class CDPController {
       });
       return { taLen: txt.length, sendDisabled: b ? b.disabled : null };
     })()`, false);
-    if (stuck0 && stuck0.sendDisabled === true) {
+    if (stuck0 && stuck0.taLen > 0 && stuck0.sendDisabled === true) {
       // 再观察 800ms 确认是持续卡死（不是框架提交中的瞬时 disabled）
       await sleep(800);
       const stuck1 = await this.evalJS(`(function () {
+        var el = document.querySelector('[contenteditable="true"], textarea');
+        var txt = el ? ((el.isContentEditable ? (el.innerText || '') : (el.value || '')).trim()) : '';
         var btns = Array.from(document.querySelectorAll('button'));
         var b = btns.find(function (x) {
           var label = (x.getAttribute('aria-label') || '') + ' ' + (x.textContent || '');
           return /发送|send/i.test(label);
         });
-        return b ? b.disabled : null;
+        return txt.length > 0 && b ? b.disabled : false;
       })()`, false);
       if (stuck1 === true) {
-        console.warn(`[cdp] 检测到按钮持续卡死(sendDisabled=true 持续 ≥ 800ms, taLen=${stuck0.taLen})，自动新建会话恢复`);
-        try {
-          await this.newSession();
-          await this.waitPageReady();
-          console.log('[cdp] 自动新建会话完成，继续注入');
-        } catch (e) {
-          console.error(`[cdp] 自动新建会话失败: ${e.message}`);
-          throw new Error(`Qwen 页面按钮卡死且新建会话失败：${e.message}。请在 Chrome 手动刷新 chat.qwen.ai 后重试`);
+        console.warn(`[cdp] 检测到输入框有内容但发送按钮持续禁用(taLen=${stuck0.taLen})，重发 input 事件强制 React 同步（不新建会话）`);
+        await this.evalJS(`(function () {
+          var el = document.querySelector('[contenteditable="true"], textarea');
+          if (!el) return;
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: el.value || el.innerText || '' }));
+          el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        })()`, false);
+        await sleep(400);
+        const recovered = await this.evalJS(`(function () {
+          var btns = Array.from(document.querySelectorAll('button'));
+          var b = btns.find(function (x) {
+            var label = (x.getAttribute('aria-label') || '') + ' ' + (x.textContent || '');
+            return /发送|send/i.test(label);
+          });
+          return b ? !b.disabled : true;
+        })()`, false);
+        if (recovered !== true) {
+          throw new Error('Qwen 页面输入框有内容但发送按钮持续禁用（React state 卡死），重发 input 无法恢复。请在 Chrome 手动刷新 chat.qwen.ai 后重试（服务不会自动新建会话）');
         }
+        console.log('[cdp] 重发 input 后发送按钮已恢复可用');
       }
     }
 

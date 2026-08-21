@@ -44,12 +44,26 @@ function fixMalformedDsml(raw) {
 }
 
 // =====================================================================
+// WorkBuddy 专有格式：真实用户消息提取
+// WorkBuddy 客户端在 user 消息中总是附带系统提示词，真实用户消息由
+// <user_query>...</user_query> 标签包裹（专有格式）。桥接层只把标签内的
+// 真实消息传给网页模型；特殊指令（NEW.TOPIC / HI,TOOLS）也在真实消息上解析。
+// 无标签时原样返回，兼容其它 OpenAI 兼容客户端。
+// =====================================================================
+function extractUserQuery(content) {
+  if (typeof content !== 'string') return content;
+  const m = content.match(/<user_query>([\s\S]*?)<\/user_query>/i);
+  return m && m[1] !== undefined ? m[1].trim() : content;
+}
+
+// =====================================================================
 // 0. 工具系统提示词按需注入（显式指令 "HI,TOOLS" 才发送一次庞大的工具系统提示词）
-//    语义：识别到指令 "HI,TOOLS" → **带上系统提示词发送 "HI" 消息**（发给网页
-//    模型的内容 = 系统提示词 + "HI"，仅这一次）；此后本会话一直不再带系统提示词
-//    发送；从未发送过 HI,TOOLS 的会话则一直不发送系统提示词。
-//    识别发生在指令当回合（调用方以 fire-and-forget 队列触发 CDP 键入，不阻塞
-//    "HI" 回复）；同一会话重复发 HI,TOOLS 只发 "HI"、不再带系统提示词（防膨胀）。
+//    语义：识别到指令 "HI,TOOLS" → **向网页发送 "HI" 消息代替客户端的 "HI,TOOLS" 文本**
+//    （发给网页模型的内容 = 系统提示词 + "HI"，仅第一次）；此后本会话一直不再带
+//    系统提示词发送；从未发送过 HI,TOOLS 的会话则一直不发送系统提示词。
+//    指令只负责触发系统提示词添加：该回合把 "HI" 真正发给网页，网页的真实回复
+//    返回给客户端（2026-08-21 调整，不再由服务器伪造 "HI" 确认响应）。
+//    同一会话重复发 HI,TOOLS 只发 "HI"、不再带系统提示词（防膨胀）。
 //    注意：归属"当前会话"，依赖客户端稳定传入相同 session_id / 复用同一网页
 //    会话；换 session_id 或 new_session 新建会话后，需在新会话再发一次。
 // =====================================================================
@@ -615,6 +629,7 @@ module.exports = {
   TOOL_ARM_COMMAND,
   detectToolArm,
   stripToolArm,
+  extractUserQuery,
   markPromptInjected,
   isPromptInjected,
   buildToolInstruction,

@@ -79,7 +79,7 @@ curl.exe --% -X POST http://localhost:3001/v1/chat/completions -H "Content-Type:
 | `model` | string | 否 | 模型路由字段（见 3.5）。不填默认 `qwen-web`；支持常见别名（`qwen-max` / `qwen-plus` / `qwen-turbo` / `qwen3` / `qwen2.5-coder` 等），全部路由到内置 `qwen-web`。未知模型也放行（非白名单） |
 | `messages` | array | **是** | 对话消息数组，取最后一条 `role: "user"` 的内容发送 |
 | `stream` | boolean | 否 | `false`（默认）返回完整 JSON；`true` 返回 SSE 流式增量 |
-| `new_session` | boolean | 否 | 显式控制新建会话（可选）。不传时：若请求带了 `session_id` 且与上次不同 → **自动新建**（见 3.3）；`true` 强制新建、`false` 强制不新建 |
+| `new_session` | boolean | 否 | 显式控制新建会话。**默认不新建**（已取消 session_id 变化自动检测）；`true` 强制新建、`false` 强制不新建。也可用发送 `NEW.TOPIC` 指令消息新建（见 3.3） |
 | `session_id` | string | 否 | 自定义会话 ID（可选，默认自动生成） |
 | `max_tokens` | number | 否 | 忽略（网页版不受控） |
 
@@ -127,24 +127,39 @@ data: [DONE]
 { "success": true, "sessionId": "...", "content": "...", "newSession": true, "timestamp": "..." }
 ```
 
-### 3.3 新建会话（自动检测 + 显式控制）
+### 3.3 新建会话（`NEW.TOPIC` 指令 / 显式字段）
 
-**方式一：自动检测（推荐，客户端零改动）**
+**默认不自动新建**（2026-08-21 调整）：已取消"客户端换 `session_id` 即自动新建页面会话"。
+网页会话的打开完全由你控制，避免 OpenWebUI / DSH 等客户端切会话时在网页侧堆积空会话、丢失上下文。
 
-服务器跟踪客户端传入的 `session_id`：请求的 `session_id` 与上次不同 → 判定客户端已新建会话 → **自动**在网页版开全新会话再发送。客户端（如 OpenWebUI、DSH）点"新会话"时天然会换新会话 id。
+**方式一：发送 `NEW.TOPIC` 控制指令（推荐）**
+
+最后一条用户消息内容为 `NEW.TOPIC`（大小写/空格/点号宽松匹配，`new topic`、`NEW TOPIC` 均可）时，
+桥接层**新建网页会话**并回显确认 `NEW.TOPIC`（不把指令转发给网页模型）。确认回执后下一条消息即落在新会话里。
 
 ```json
-// 客户端第一次：session_id=sess-A → 使用当前页面
-{ "messages": [{ "role": "user", "content": "你好" }], "session_id": "sess-A" }
-// 同一会话继续 → 同页面继续
-{ "messages": [{ "role": "user", "content": "继续说" }], "session_id": "sess-A" }
-// 客户端新建会话：session_id=sess-B → 自动新建页面会话 ✓
-{ "messages": [{ "role": "user", "content": "你好" }], "session_id": "sess-B" }
+// 客户端：单独发一条 NEW.TOPIC 指令
+{ "model": "qwen-web", "messages": [{ "role": "user", "content": "NEW.TOPIC" }] }
+// 响应（OpenAI 标准格式，content 回显指令）：
+{ "choices": [{ "message": { "role": "assistant", "content": "NEW.TOPIC" } }] }
+
+// 然后发真实提问 → 落在新建的网页会话中
+{ "model": "qwen-web", "messages": [{ "role": "user", "content": "你好" }] }
 ```
 
-> 仅当请求**显式携带** `session_id` 时启用自动检测。不带 `session_id` 的请求不会触发新建。
+> 指令独立发送、不与真实提问混在同一回合（混在一起会被当作普通消息处理，不触发新建）。
+> 新建在串行队列中 fire-and-forget 执行：确认回执立即返回，下一条消息排在新建之后执行，天然落在新会话。
 
-**方式二：显式字段**：`"new_session": true` 强制新建；`"new_session": false` 强制不新建（优先级高于自动检测）。
+**方式二：显式字段**：`"new_session": true` 强制新建；`"new_session": false` 强制不新建。
+
+```json
+// 强制新建（与 NEW.TOPIC 等效）
+{ "messages": [{ "role": "user", "content": "你好" }], "new_session": true }
+```
+
+> 注意：换 `session_id` 不再自动新建会话——同一 `session_id` 继续在同一网页会话，换 id 也继续沿用当前网页会话，除非显式新建。
+>
+> 彻底性：除上述两种显式途径外，桥接层**不会**在任何时机自动新建网页会话（含页面在根路径无会话、发送按钮状态异常等场景，一律保持当前会话页面，仅记录日志或报错提示手动处理）。
 
 ### 3.4 CORS（浏览器前端直接调用）
 
@@ -196,13 +211,22 @@ Qwen **网页版没有对外的原生 function-calling 协议**（不同于官�
 由于上层 agent 每次请求都携带 `tools`，若每轮都把庞大的工具说明前缀注入网页模型，对话上下文与 token 成本会显著膨胀。本桥改为**只在识别到指令 `HI,TOOLS` 时，带上系统提示词发送一次 `HI` 消息**：
 
 - **默认一直不发送**：会话从未发送过 `HI,TOOLS` 时，即使请求带 `tools`，桥接层也**不发送**工具系统提示词，网页模型按普通问答处理（不会触发 `tool_calls`）。
-- **识别到即带提示词发 `HI`**：请求中的 user 消息含 `HI,TOOLS`（大小写/空格宽松匹配，如 `HI, TOOLS`）时，桥接层把**系统提示词 + `HI` 消息**作为发给网页模型的内容（`系统提示词\n\nHI`），**仅这一次**；同时回正文 `HI`。
-- **握手为后台执行，回 `HI` 不等待**：握手消息走串行队列 fire-and-forget，`HI` 立即返回（JSON 或 SSE）。
+- **识别到即向网页发 `HI`（代替 `HI,TOOLS` 文本）**：请求中的 user 消息含 `HI,TOOLS`（大小写/空格宽松匹配，如 `HI, TOOLS`）时，桥接层**不把 `HI,TOOLS` 文本发给网页**，而是发送 `系统提示词 + HI`（首次带 tools 时内容为 `系统提示词\n\nHI`；仅这一次）。
+- **返回网页真实回复（2026-08-21 调整）**：该回合不再由服务器伪造 `HI` 确认响应，而是把 `HI` 真正发给网页后，将**网页的真实回复**返回给客户端（流式按增量推送）。指令本身只负责触发系统提示词添加。
 - **同会话不再带提示词**：本会话（同一 `session_id`）后续所有请求（含再次发 `HI,TOOLS`）都**不再带系统提示词**——再次发 `HI,TOOLS` 只发 `HI`。系统提示词留在网页会话历史中，后续带 `tools` 的请求直接发真实提问，模型依据历史中的提示词产生 `tool_calls`。
 
 - **识别条件=最后一次用户消息**：客户端常携带多轮历史（其中含以前的 `HI,TOOLS` 指令），桥接层**只识别最后一次用户消息**——历史里的旧 `HI,TOOLS` 不会触发握手，只有最新一次用户指令是 `HI,TOOLS` 才算。
 
-> 依赖：握手归属"当前会话"——请用**相同 `session_id`** 复用在同一网页会话；若换 `session_id` 或 `new_session` 新建会话，新会话历史中没有提示词，需要在新会话里再发一次 `HI,TOOLS`（带 `tools`）。`HI,TOOLS` 应作为独立回合发送（带 `tools` 参数），若与真实提问混在同一回合，该回合会被当作握手处理、提问不转发。进程重启后注入状态清空。
+> 依赖：握手归属"当前会话"——请用**相同 `session_id`** 复用在同一网页会话；若发 `NEW.TOPIC` 指令或 `new_session: true` 新建会话，新会话历史中没有提示词，需要在新会话里再发一次 `HI,TOOLS`（带 `tools`）。`HI,TOOLS` 应作为独立回合发送（带 `tools` 参数），若与真实提问混在同一回合，该回合会被当作握手处理、提问不转发（只向网页发 `HI`，返回网页对 `HI` 的回复）。进程重启后注入状态清空。
+
+### 3.8 WorkBuddy 专有格式支持（`<user_query>` 标签）
+
+WorkBuddy 客户端调用时，user 消息里总是附带系统提示词，**真实用户消息由 `<user_query>...</user_query>` 标签包裹**。桥接层会自动解析该格式（`tooluse.extractUserQuery`）：
+
+- **非 `HI,TOOLS` 时只传真实消息**：发给网页模型的内容 = `<user_query>` 标签内的文本（不含客户端附加的系统提示词、不含标签本身），避免 WorkBuddy 系统提示词污染网页会话上下文。
+- **指令优先在真实消息上解析**：`NEW.TOPIC` / `HI,TOOLS` 均在提取后的真实消息上检测（`<user_query>NEW.TOPIC</user_query>` 同样触发新建会话）。
+- **`HI,TOOLS` 时注入全部系统提示词**：仅在 `HI,TOOLS` 指令回合注入工具系统提示词（见 3.7），其余回合一律不注入。
+- 无 `<user_query>` 标签的消息（普通 OpenAI 客户端）原样传递，完全兼容。
 
 ---
 
@@ -237,6 +261,11 @@ curl -X POST http://localhost:3001/v1/chat/completions \
 curl -N -X POST http://localhost:3001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen-web","messages":[{"role":"user","content":"你好"}],"stream":true}'
+
+# 新建会话：发一条 NEW.TOPIC 指令（回显 NEW.TOPIC，不转发给模型）
+curl -X POST http://localhost:3001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen-web","messages":[{"role":"user","content":"NEW.TOPIC"}]}'
 ```
 
 ### 4.3 其他工具
@@ -254,6 +283,7 @@ curl -N -X POST http://localhost:3001/v1/chat/completions \
 |---|---|
 | **单页面串行** | 同页面同一份对话上下文，请求严格串行（排队），并发会排队等待而非并行 |
 | **登录态** | 依赖 Chrome 窗口保持登录；登录过期/验证码会导致超时（60s），把页面切回聊天页并重新登录即可 |
+| **CDP 连接** | 服务端显式用 `127.0.0.1:9222` 连接 Chrome（Chrome 调试端口默认仅监听 IPv4，且新版 Node 解析 `localhost` 可能优先 `::1` 被拒）。如确有需要可用环境变量 `CDP_HOST` 覆盖 |
 | **页面改版** | 输入框/发送按钮/回复元素选择器基于当前页面结构（**2026-08-21 实测**），改版后需更新 `cdp-controller.js` 中的选择器，可用 `_debug_page.js` 重新探测 |
 | **思考模式** | 网页「深度思考」开启时需等待思考+回答全部结束才返回（思考内容自动从回答中排除，见 3.5） |
 | **SSE 格式** | Qwen v2 接口结束帧为 `delta.status="finished"`（无 `[DONE]`/`finish_reason`），解析器已适配；接口升级时用 `_capture_probe.js` 重新抓取原始流校验 |
