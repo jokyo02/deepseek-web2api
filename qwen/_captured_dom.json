@@ -1,0 +1,127 @@
+[
+ {
+  "i": 82,
+  "cls": "chat-user-message-container-wrapper ant-flex css-mncuj7",
+  "text": "请回复三个字：测试通过"
+ },
+ {
+  "i": 83,
+  "cls": "chat-user-message-container",
+  "text": "请回复三个字：测试通过"
+ },
+ {
+  "i": 84,
+  "cls": "chat-user-message-wrapper ant-flex css-mncuj7 ant-flex-justify-flex-en",
+  "text": "请回复三个字：测试通过"
+ },
+ {
+  "i": 85,
+  "cls": "chat-user-message",
+  "text": "请回复三个字：测试通过"
+ },
+ {
+  "i": 90,
+  "cls": "qwen-chat-message qwen-chat-message-assistant qwen-chat-message-awaiti",
+  "text": "已经完成思考\n测试通过"
+ },
+ {
+  "i": 91,
+  "cls": "chat-response-message",
+  "text": "已经完成思考\n测试通过"
+ },
+ {
+  "i": 92,
+  "cls": "chat-response-message-right",
+  "text": "已经完成思考\n测试通过"
+ },
+ {
+  "i": 93,
+  "cls": "qwen-chat-thinking-tool-status-card-wraper ant-flex css-mncuj7",
+  "text": "已经完成思考"
+ },
+ {
+  "i": 94,
+  "cls": "qwen-chat-tool-status-card qwen-chat-thinking-status-card-completed an",
+  "text": "已经完成思考"
+ },
+ {
+  "i": 95,
+  "cls": "qwen-chat-thinking-status-card-content ant-flex css-mncuj7 ant-flex-al",
+  "text": "已经完成思考"
+ },
+ {
+  "i": 96,
+  "cls": "qwen-chat-thinking-status-card-title ant-flex css-mncuj7 ant-flex-alig",
+  "text": "已经完成思考"
+ },
+ {
+  "i": 97,
+  "cls": "qwen-chat-thinking-status-card-title-text",
+  "text": "已经完成思考"
+ },
+ {
+  "i": 99,
+  "cls": "response-message-content t2t phase-answer",
+  "text": "测试通过"
+ },
+ {
+  "i": 100,
+  "cls": "custom-qwen-markdown",
+  "text": "测试通过"
+ },
+ {
+  "i": 101,
+  "cls": "qwen-markdown",
+  "text": "测试通过"
+ },
+ {
+  "i": 102,
+  "cls": "qwen-markdown-paragraph",
+  "text": "测试通过"
+ },
+ {
+  "i": 115,
+  "cls": "chat-layout-input-container",
+  "text": "自动"
+ },
+ {
+  "i": 116,
+  "cls": "message-input-wrapper",
+  "text": "自动"
+ },
+ {
+  "i": 119,
+  "cls": "message-input-container",
+  "text": "自动"
+ },
+ {
+  "i": 120,
+  "cls": "message-input-container-area",
+  "text": "自动"
+ },
+ {
+  "i": 123,
+  "cls": "message-input-right-button",
+  "text": "自动"
+ },
+ {
+  "i": 124,
+  "cls": "qwen-chat-v2-dropdown-menu",
+  "text": "自动"
+ },
+ {
+  "i": 125,
+  "cls": "qwen-chat-v2-dropdown-menu-trigger",
+  "text": "自动"
+ },
+ {
+  "i": 126,
+  "cls": "qwen-chat-v2-dropdown-menu-select qwen-chat-v2-dropdown-menu-select-bu",
+  "text": "自动"
+ },
+ {
+  "i": 129,
+  "cls": "chat-container-statement",
+  "text": "人工智能生成的内容可能不准确。"
+ }
+]

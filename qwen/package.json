@@ -1,0 +1,15 @@
+{
+  "name": "qwen-cdp-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "纯 CDP 方案：控制已打开的 Qwen AI 网页版（chat.qwen.ai），Network 层 SSE 捕获完整回复并回传，提供 OpenAI 兼容 API",
+  "main": "api-server.js",
+  "scripts": {
+    "start": "node api-server.js",
+    "selftest": "node _sse_selftest.js"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.2",
+    "express": "^4.19.2"
+  }
+}
