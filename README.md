@@ -204,12 +204,14 @@ curl http://localhost:3000/v1/models
 
 ### 3.6 工具调用（Tool Use / Function Calling）
 
-DeepSeek **网页版没有原生的 function-calling 协议**（不像官方 `api.deepseek.com` API），本桥靠"键入文本 + 读回回复"驱动模型。为支持 OpenAI 的 `tools`/`tool_calls`，本服务用一套**约定格式**让网页模型"假装"支持工具调用（见 `tooluse.js`）：
+DeepSeek **网页版没有原生的 function-calling 协议**（不像官方 `api.deepseek.com` API），本桥靠"键入文本 + 读回回复"驱动模型。为支持 OpenAI 的 `tools`/`tool_calls`，本服务用一套**约定格式（DSML，DeepSeek Markup Language）**让网页模型"假装"支持工具调用（见 `tooluse.js`）：
 
-1. 请求带 `tools` 时，桥接层把**工具清单 + 调用规则**作为前缀注入到用户消息里发给 DeepSeek；
-2. 捕获回复，用定界符 `__TOOL_CALL__{"name":...,"arguments":{...}}__END__` 抽取工具调用；
-3. 转成 OpenAI 标准 `tool_calls` 返回（`finish_reason: "tool_calls"`，`content: null`）；
+1. 请求带 `tools` 时，桥接层把**工具清单 + 调用规则（DSML 格式说明）**作为前缀注入到用户消息里发给 DeepSeek；
+2. 捕获回复，用 DSML 标签 `<|DSML|tool_calls>` → `<|DSML|invoke name="…">` → `<|DSML|parameter name="…"><![CDATA[…]]></|DSML|parameter>` 抽取工具调用；字符串参数值放在 `<![CDATA[…]]>` 中，天然免疫引号/花括号/换行破坏；
+3. 转成 OpenAI 标准 `tool_calls` 返回（`finish_reason: "tool_calls"`）；**正文与工具调用可共存**——模型"先说一句再调工具"时，正文会作为 `content` 一并返回（不再是旧版的互斥丢弃）；
 4. 客户端执行工具后，把 `role: "tool"` 的结果发回，桥接层把结果**键入页面**续聊，模型据此给出最终答案。
+
+> **DSML 设计借鉴** `deepseek-web2api-free` 项目的 DSML + StreamSieve 思路，并做了两点关键增强：① content 与 tool_calls 不再互斥；② 流式场景下用 `ToolStreamSieve` 逐字符分离正文与工具调用，正文实时吐出、工具调用块闭合后才 flush。
 
 **请求示例（带工具）：**
 
@@ -228,14 +230,14 @@ DeepSeek **网页版没有原生的 function-calling 协议**（不像官方 `ap
 }
 ```
 
-**第一轮响应（模型要求调用工具）：**
+**第一轮响应（模型先说明再调工具，正文与 tool_calls 共存）：**
 
 ```json
 {
   "id": "chatcmpl-...", "object": "chat.completion", "model": "deepseek-web",
   "choices": [{
     "index": 0,
-    "message": { "role": "assistant", "content": null,
+    "message": { "role": "assistant", "content": "我来帮你查一下。",
       "tool_calls": [{ "id": "call_xxx_0", "type": "function",
         "function": { "name": "get_weather", "arguments": "{\"location\":\"北京\"}" } }] },
     "finish_reason": "tool_calls"
@@ -243,6 +245,8 @@ DeepSeek **网页版没有原生的 function-calling 协议**（不像官方 `ap
   "usage": { "prompt_tokens": 38, "completion_tokens": 1, "total_tokens": 39 }
 }
 ```
+
+> `content` 为空时返回 `null`；有正文时返回正文。客户端应同时处理这两种情况。
 
 **第二轮（客户端回传工具结果，继续对话）：**
 
@@ -257,12 +261,15 @@ DeepSeek **网页版没有原生的 function-calling 协议**（不像官方 `ap
 }
 ```
 
-> 流式（`stream: true`）同样支持：工具调用以 `tool_calls` 增量帧返回，结束帧 `finish_reason: "tool_calls"` 后跟 `[DONE]`。
+> 流式（`stream: true`）同样支持：正文以 `delta.content` 增量帧**实时**吐出，工具调用以 `delta.tool_calls` 帧在块闭合后返回，结束帧 `finish_reason` 据是否存在工具调用取 `"tool_calls"` 或 `"stop"`，后跟 `[DONE]`。
 
 **注意事项（重要）：**
-- 这是**基于提示词的尽力而为方案**：可靠性取决于网页模型对 `__TOOL_CALL__…__END__` 格式的遵循度；模型偶尔可能输出多余文字或漏掉格式，此时会按普通回答处理（不触发 `tool_calls`）。
+- 这是**基于提示词的尽力而为方案**：可靠性取决于网页模型对 DSML 格式的遵循度；模型偶尔可能输出多余文字或漏掉格式，此时会按普通回答处理（不触发 `tool_calls`）。
 - 注入的工具说明前缀会**出现在 DeepSeek 网页对话里**（作为可见消息的一部分），属该方案的固有代价。
-- `arguments` 由模型生成，桥接层只做 JSON 解析与透传，不校验 schema；客户端应自行校验参数。
+- `arguments` 由模型生成，桥接层做 JSON 解析 / CDATA 提取 / 自动类型转换（数字、布尔、null）与透传，不校验 schema；客户端应自行校验参数。
+- **向后兼容**：旧版 `__TOOL_CALL__{"name":…,"arguments":{…}}__END__` 定界符仍可被解析（仅解析兼容，注入格式已统一切换为 DSML）。
+- 普通正文若含 `<`（如 `1 < 2`）不会被误判为工具调用；异常超长未闭合的工具块会触发缓冲上限保护，强制当正文吐出，避免卡死。
+- **容错**：模型偶发把结束标签写成 `</<|DSML|parameter>`（多了一个 `<`）时，解析器会先归一化为规范的 `</|DSML|parameter>` 再解析，避免整段 DSML 泄漏为原样正文；提示词也明确警告模型不要双写 `<`。
 
 ---
 
@@ -369,7 +376,8 @@ curl -N -X POST http://localhost:3000/v1/chat/completions \
 |---|---|
 | `api-server.js` | API 服务器：OpenAI 兼容端点 + 模型路由校验 + 串行队列 + 错误处理 |
 | `models.js` | 模型路由注册表：内置 `deepseek-web` + 常用别名映射 + `/v1/models` 列表（改模型只动这里） |
-| `tooluse.js` | 工具调用层：把 OpenAI `tools` 转为提示词约定、抽取 `__TOOL_CALL__…__END__` 工具调用、反查工具名 |
+| `tooluse.js` | 工具调用层（DSML）：把 OpenAI `tools` 转为 DSML 提示词注入、抽取 `<|DSML|…>` 工具调用（含 CDATA 参数解析/自动类型）、`ToolStreamSieve` 流筛分引擎、旧 `__TOOL_CALL__` 向后兼容、反查工具名 |
+| `tooluse.test.js` | 纯逻辑单元测试（无需 Chrome）：DSML 解析、CDATA 特殊字符、多 invoke、旧格式兼容、`ToolStreamSieve` 流分离；`node tooluse.test.js` 运行 |
 | `cdp-controller.js` | CDP 控制器：连接页面、一次性写入文本（不粘贴/不重复录入）+ 发送、按模型切换网页模式、DOM 轮询捕获回复 |
 | `page-hook.js` | **已弃用**（早期页面内 hook 方案，死代码，可删除） |
 | `package.json` | 依赖：express、chrome-remote-interface |

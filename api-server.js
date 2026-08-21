@@ -161,15 +161,18 @@ async function handleCompletions(req, res) {
   enqueue(async () => {
     try {
       if (toolMode) {
-        const result = await cdp.executeChat(sessionId, outgoing, opts);
-        const callsRaw = tooluse.extractToolCalls(result.content);
-        if (callsRaw) {
-          const calls = finalizeToolCalls(callsRaw);
-          if (stream) await streamToolCalls(res, modelOut, sessionId, calls);
-          else res.json(buildToolCallCompletion(modelOut, sessionId, calls, outgoing, result.content));
+        if (stream) {
+          // 流式工具模式：正文实时吐出，工具调用块闭合后才 flush（详见 streamToolMode）
+          await streamToolMode(res, modelOut, sessionId, outgoing, opts);
         } else {
-          if (stream) await streamContent(res, modelOut, sessionId, result.content);
-          else res.json(buildCompletion(modelOut, sessionId, outgoing, result.content));
+          const result = await cdp.executeChat(sessionId, outgoing, opts);
+          // parseToolOutput 同时返回 正文(content) 与 tool_calls，二者可共存（修复旧版 XOR bug）
+          const parsed = tooluse.parseToolOutput(result.content);
+          if (parsed.toolCalls.length) {
+            res.json(buildToolCallCompletion(modelOut, sessionId, parsed.toolCalls, parsed.text));
+          } else {
+            res.json(buildCompletion(modelOut, sessionId, outgoing, parsed.text || ''));
+          }
         }
       } else if (stream) {
         await handleStreaming(req, res, { model: modelOut, sessionId, message: outgoing, opts });
@@ -215,23 +218,11 @@ function buildCompletion(model, sessionId, prompt, content) {
 
 // —— 工具调用（tool_calls）相关构造 ——
 
-// 把抽取出的原始调用 [{name, arguments}] 规范为 OpenAI tool_calls 对象数组
-function finalizeToolCalls(calls) {
-  const ts = Date.now().toString(36);
-  return calls.map((c, i) => ({
-    id: `call_${ts}_${i}`,
-    type: 'function',
-    function: {
-      name: c.name,
-      arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments || {}),
-    },
-  }));
-}
-
 // 构造 OpenAI 标准非流式「工具调用」响应
-function buildToolCallCompletion(model, sessionId, calls, prompt, raw) {
+// 注意：content 与 tool_calls 可共存（模型先说一句再调工具时，正文也会被保留返回）
+function buildToolCallCompletion(model, sessionId, calls, text) {
   const created = Math.floor(Date.now() / 1000);
-  const content = typeof raw === 'string' ? raw : '';
+  const content = typeof text === 'string' ? text : '';
   return {
     id: `chatcmpl-${sessionId}`,
     object: 'chat.completion',
@@ -240,14 +231,14 @@ function buildToolCallCompletion(model, sessionId, calls, prompt, raw) {
     choices: [
       {
         index: 0,
-        message: { role: 'assistant', content: null, tool_calls: calls },
+        message: { role: 'assistant', content: content || null, tool_calls: calls },
         finish_reason: 'tool_calls',
       },
     ],
     usage: {
-      prompt_tokens: Math.max(1, Math.ceil((prompt || '').length / 1.5)),
+      prompt_tokens: Math.max(1, Math.ceil((content.length + 1) / 1.5)),
       completion_tokens: Math.max(1, Math.ceil(content.length / 1.5)),
-      total_tokens: Math.max(2, Math.ceil(((prompt || '').length + content.length) / 1.5)),
+      total_tokens: Math.max(2, Math.ceil((content.length * 2 + 1) / 1.5)),
     },
   };
 }
@@ -287,8 +278,9 @@ async function streamContent(res, model, sessionId, content) {
   res.end();
 }
 
-// 流式输出：工具调用（role 帧 → 各 tool_call 帧 → 结束帧 → [DONE]）
-async function streamToolCalls(res, model, sessionId, calls) {
+// 流式工具模式：接入 ToolStreamSieve，实时分离正文与工具调用。
+// 正文增量立即以 delta.content 帧吐出；工具调用块闭合后才以 delta.tool_calls 帧 flush。
+async function streamToolMode(res, model, sessionId, message, opts) {
   const created = Math.floor(Date.now() / 1000);
   const chatId = `chatcmpl-${sessionId}`;
   res.writeHead(200, {
@@ -296,32 +288,81 @@ async function streamToolCalls(res, model, sessionId, calls) {
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
   });
+
+  // 首个 chunk：声明 assistant 角色
   res.write(
     `data: ${JSON.stringify({
       id: chatId, object: 'chat.completion.chunk', created, model,
-      choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }],
+      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
     })}\n\n`
   );
-  calls.forEach((c, i) => {
-    res.write(
-      `data: ${JSON.stringify({
-        id: chatId, object: 'chat.completion.chunk', created, model,
-        choices: [{
-          index: 0,
-          delta: { tool_calls: [{ index: i, id: c.id, type: 'function', function: { name: c.function.name, arguments: c.function.arguments } }] },
-          finish_reason: null,
-        }],
-      })}\n\n`
-    );
-  });
+
+  const sieve = new tooluse.ToolStreamSieve((buf) => tooluse.parseToolOutput(buf));
+  const state = { hasToolCalls: false };
+  let lastLen = 0;
+
+  const onProgress = (answer) => {
+    if (typeof answer !== 'string') return;
+    if (answer.length > lastLen) {
+      const delta = answer.slice(lastLen);
+      lastLen = answer.length;
+      emitSieveEvents(res, model, chatId, created, sieve.feed(delta), state);
+    }
+  };
+
+  const result = await cdp.executeChat(sessionId, message, { ...opts, onProgress });
+
+  // 补齐：确保最终完整内容的尾部也推进了筛分器（避免 onProgress 未推送最后一截）
+  const finalText = (result && result.content) || '';
+  if (finalText.length > lastLen) {
+    emitSieveEvents(res, model, chatId, created, sieve.feed(finalText.slice(lastLen)), state);
+    lastLen = finalText.length;
+  }
+  // 收尾：flush 剩余 pending / 未闭合捕获区
+  emitSieveEvents(res, model, chatId, created, sieve.flush(), state);
+
+  // 结束帧
   res.write(
     `data: ${JSON.stringify({
       id: chatId, object: 'chat.completion.chunk', created, model,
-      choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+      choices: [{ index: 0, delta: {}, finish_reason: state.hasToolCalls ? 'tool_calls' : 'stop' }],
     })}\n\n`
   );
   res.write('data: [DONE]\n\n');
   res.end();
+}
+
+// 把筛分器产生的事件写成 SSE 帧
+function emitSieveEvents(res, model, chatId, created, events, state) {
+  for (const ev of events) {
+    if (ev.type === 'text' && ev.data) {
+      res.write(
+        `data: ${JSON.stringify({
+          id: chatId, object: 'chat.completion.chunk', created, model,
+          choices: [{ index: 0, delta: { content: ev.data }, finish_reason: null }],
+        })}\n\n`
+      );
+    } else if (ev.type === 'tool_calls' && ev.data && ev.data.length) {
+      state.hasToolCalls = true;
+      ev.data.forEach((c, i) => {
+        res.write(
+          `data: ${JSON.stringify({
+            id: chatId, object: 'chat.completion.chunk', created, model,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: i, id: c.id, type: 'function',
+                  function: { name: c.function.name, arguments: c.function.arguments },
+                }],
+              },
+              finish_reason: null,
+            }],
+          })}\n\n`
+        );
+      });
+    }
+  }
 }
 
 // SSE 流式：DOM 轮询每次检测到文本增长 → 推送 delta 增量帧 → 结束帧 → [DONE]
