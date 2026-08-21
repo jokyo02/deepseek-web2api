@@ -37,6 +37,43 @@ const ASSISTANT_CONTENT_SELECTOR =
   'div[class*="response-message-content"], div[class*="qwen-chat-message"], ' +
   'div[class*="assistant-message"], div[class*="message-content"]';
 
+// 在页面上下文读取「最后一条助手消息」的状态（DOM 兜底用）。
+// 关键修复（2026-08-21）：思考模式下整条消息容器(qwen-chat-message)同时包含「思考状态卡片」与「回答正文」，
+//   且思考未完成时页面会显示「跳过」按钮及其文案。若直接读整条 innerText：
+//     a) 思考中读取 → 得到"思考中…跳过"等提示符，3s 稳定即被误判为最终答复；
+//     b) 思考完成后读取 → 仍带"已经完成思考"等思考卡片文案，混入真实回答。
+//   因此本函数：① 优先取「回答阶段」专属节点 div[class*="phase-answer"]（只含真实回答）；
+//               ② 返回 thinking 标志：思考状态卡片未 completed 或页面存在「跳过/Skip」按钮 → 仍在思考；
+//               ③ 兜底清洗：整条消息回退读取时，去掉行首思考卡片残留文案。
+// 返回值：{ count, last, thinking } —— last 为回答正文（已尽可能排除思考内容）。
+const READ_ASSISTANT_STATE_JS = `(() => {
+  const MSG = 'div[class*="response-message-content"], div[class*="qwen-chat-message"], div[class*="chat-response-message"], div[class*="assistant-message"], div[class*="message-content"]';
+  const msgs = Array.from(document.querySelectorAll(MSG));
+  if (!msgs.length) return { count: 0, last: '', thinking: false };
+  const last = msgs[msgs.length - 1];
+  // ① 优先回答阶段专属节点
+  let ans = null;
+  try { ans = last.querySelector('div[class*="phase-answer"]'); } catch (e) { ans = null; }
+  let text = ans ? (ans.innerText || '').trim() : (last.innerText || '').trim();
+  // ② 是否仍在思考
+  let thinking = false;
+  const tc = last.querySelector('[class*="thinking-status-card"]');
+  if (tc && !/completed/i.test(tc.className || '')) thinking = true;
+  if (!thinking) {
+    const cands = Array.from(last.querySelectorAll('button, [role="button"], a, span, div'));
+    for (let i = 0; i < cands.length; i++) {
+      const el = cands[i];
+      const t = ((el.innerText || '') + ' ' + (el.getAttribute ? (el.getAttribute('aria-label') || '') : '')).trim();
+      if (t === '跳过' || /^skip$/i.test(t)) { thinking = true; break; }
+    }
+  }
+  // ③ 兜底清洗：整条消息回退时去掉行首思考卡片文案
+  if (!ans) {
+    text = text.replace(/^(已经完成思考|思考已完成|思考已结束|思考中|正在思考|Thinking)\\s*/i, '').trim();
+  }
+  return { count: msgs.length, last: text, thinking: thinking };
+})()`;
+
 class CDPController {
   constructor() {
     this.client = null;
@@ -371,14 +408,9 @@ class CDPController {
   }
 
   // —— DOM 兜底 ——
+  // 读取最后一条助手消息状态：回答正文 + 是否仍在思考（见 READ_ASSISTANT_STATE_JS）
   async snapshotAssistant() {
-    return this.evalJS(`(() => {
-      const els = document.querySelectorAll('${ASSISTANT_CONTENT_SELECTOR}');
-      return {
-        count: els.length,
-        last: els.length ? (els[els.length - 1].innerText || '').trim() : '',
-      };
-    })()`);
+    return this.evalJS(READ_ASSISTANT_STATE_JS);
   }
 
   // 代码块完整性自检（DOM 兜底用）
@@ -402,25 +434,22 @@ class CDPController {
   }
 
   // 轮询 DOM 等待新回复（兜底）：文本连续 STABLE_MS 不变视为流式结束
+  // 关键修复（2026-08-21）：思考模式下绝不提前返回——只要 thinking=true（思考状态卡片未 completed
+  //   或页面仍存在「跳过/Skip」按钮），即使文本暂时稳定也持续等待，避免把"跳过"提示符当答复。
   async waitForNewReply(snap, timeoutMs, onProgress) {
     const deadline = Date.now() + timeoutMs;
     const pollInterval = 500;
-    const { count: prevCount, last: prevText } = snap || {};
+    const { count: prevCount, last: prevText, thinking: prevThinking } = snap || {};
     let lastText = null;
     let stableSince = 0;
 
     while (Date.now() < deadline) {
-      const res = await this.evalJS(`(() => {
-        const els = document.querySelectorAll('${ASSISTANT_CONTENT_SELECTOR}');
-        return {
-          count: els.length,
-          last: els.length ? (els[els.length - 1].innerText || '').trim() : '',
-        };
-      })()`);
+      const res = await this.evalJS(READ_ASSISTANT_STATE_JS);
       const text = (res && res.last) || '';
+      const thinking = !!(res && res.thinking);
       const isNew = text && (res.count > prevCount || (prevText && text !== prevText));
 
-      if (isNew) {
+      if (isNew && !thinking) {
         if (text === lastText) {
           if (stableSince === 0) stableSince = Date.now();
           else if (Date.now() - stableSince >= STABLE_MS) {
@@ -432,6 +461,9 @@ class CDPController {
           stableSince = 0;
           if (typeof onProgress === 'function') onProgress(text);
         }
+      } else {
+        // 仍在思考 / 尚无新内容 → 重置稳定计时，继续等待
+        stableSince = 0;
       }
       await sleep(pollInterval);
     }
@@ -832,12 +864,17 @@ function extractQwenTexts(j) {
 }
 
 // 检测 SSE 原文中是否出现流式结束信号。
-// 实测 Qwen v2（2026-08-21）结束帧：{"delta":{"role":"assistant","content":"","status":"finished","phase":"answer"}}
-//   —— delta.status === "finished" 是主信号（无 [DONE]/finish_reason）。
+// 实测 Qwen v2（2026-08-21）思考 + 回答两阶段 SSE：
+//   思考阶段结束帧：{"delta":{"content":"","phase":"thinking_summary","status":"finished"}}  ← 仅是"思考"结束，整条流未完
+//   回答阶段结束帧：{"delta":{"content":"","phase":"answer","status":"finished"}}            ← 整条流真正结束
+//   思考内容位于 delta.extra.summary_thought（不在 delta.content），回答内容在 delta.content。
+// 关键修复（2026-08-21）：原逻辑只判 delta.status === 'finished' 不区分 phase，
+//   会在「思考阶段结束帧」就误判整条流结束 → 此时累积 content 仍为空 → resolve(null) → 回落 DOM 兜底 → 读到"跳过"。
+//   因此必须要求 phase 为 answer（或非思考阶段）才视为结束；thinking/thinking_summary 阶段的 finished 一律忽略。
 // 兼容：OpenAI 兼容 finish_reason 帧；DashScope 原生 finish_reason 为字符串 "null"（进行中），非 "null" 即结束。
 function sseStreamFinished(body) {
   if (!body) return false;
-  // 逐行找 data: JSON，检查 delta.status === 'finished' 或 finish_reason 非 null
+  // 逐行找 data: JSON，检查结束信号
   const lines = body.split('\n');
   for (const line of lines) {
     const t = line.trim();
@@ -849,8 +886,13 @@ function sseStreamFinished(body) {
       if (Array.isArray(j.choices)) {
         for (const c of j.choices) {
           if (!c) continue;
-          // Qwen v2：delta.status === "finished"
-          if (c.delta && c.delta.status === 'finished') return true;
+          // Qwen v2：delta.status === "finished" —— 但必须排除「思考阶段」结束帧
+          if (c.delta && c.delta.status === 'finished') {
+            const phase = c.delta.phase;
+            // 思考阶段结束（thinking_summary / thinking）不算整条流结束，必须等 answer 阶段
+            const isThinkingPhase = /thinking/i.test(String(phase || ''));
+            if (!isThinkingPhase) return true;
+          }
           // OpenAI 兼容：finish_reason 非空非 null
           if (c.finish_reason && c.finish_reason !== 'null' && c.finish_reason !== null) return true;
         }
