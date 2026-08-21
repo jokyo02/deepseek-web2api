@@ -136,6 +136,22 @@ class CDPController {
   // —— 主流程：SSE 捕获 + DOM 兜底 ——
   async executeChat(sessionId, message, opts = {}) {
     await this.ensureConnected();
+
+    // —— 0. 状态恢复：关闭可能残留的模态对话框 ——
+    // 场景（2026-08-21 现场事故）：Qwen 页面在深度思考 / 工具调用模式下，可能弹出
+    //   "ask_user_question" 等模态对话框接管输入框与发送按钮（sendDisabled=true 但 taLen=0），
+    //   此时注入普通消息会失败。先派发 Escape 键尝试关闭任何模态；如果页面没对话框则 no-op。
+    await this.evalJS(`(function () {
+      try {
+        var opts = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true };
+        document.dispatchEvent(new KeyboardEvent('keydown', opts));
+        document.body.dispatchEvent(new KeyboardEvent('keydown', opts));
+        window.dispatchEvent(new KeyboardEvent('keydown', opts));
+      } catch (e) {}
+      return true;
+    })()`, false);
+    await sleep(300);
+
     if (opts.newSession) await this.newSession();
 
     const url = await this.evalJS('location.href');
@@ -466,9 +482,14 @@ class CDPController {
   //   - 内容已就绪（有文本且按钮可点）→ 点击发送；然后等待并检查是否清空
   //   - 未清空则继续等待/重试点击，直到预算耗尽或真正发送成功
   // 预算耗尽仍失败 → 最后回退 Enter 键。
+  //
+  // 关键修复（2026-08-21 现场事故）：长文本写入失败后，Qwen React state 卡在"空"，
+  // DOM 残留 90 字、按钮永久 disabled。如果在 ~1.2s 内一直检测到「按钮 disabled + DOM 有内容」，
+  // 主动重发 input 事件强制 React 把 state 同步到当前 DOM（修复卡死状态）。
   async triggerSend(maxWaitMs = 3000, pollMs = 250) {
     const deadline = Date.now() + maxWaitMs;
     let attempt = 0;
+    let stuckSince = 0; // 状态卡死计时器（disabled + 有内容）
     while (Date.now() < deadline) {
       attempt++;
       const st = await this.evalJS(`(function () {
@@ -486,11 +507,29 @@ class CDPController {
         return {
           empty: txt.length === 0,
           ready: txt.length > 0 && (!b || !b.disabled),
+          stuck: txt.length > 0 && b && b.disabled, // 卡死：有内容但按钮禁用
         };
       })()`);
       if (st && st.empty) {
         console.log('[cdp] 输入框已清空，发送成功');
         return 'click';
+      }
+      // 卡死恢复：disabled + DOM 有内容持续 ≥ 1.2s → 主动重发 input 事件，让 React 重新读 DOM
+      if (st && st.stuck) {
+        if (stuckSince === 0) stuckSince = Date.now();
+        if (Date.now() - stuckSince >= 1200) {
+          await this.evalJS(`(function () {
+            var el = document.querySelector('[contenteditable="true"], textarea');
+            if (!el) return;
+            // 强制重新触发 React 监听的 input 事件，把 DOM 当前 value 推回 state
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: el.value || el.innerText || '' }));
+            el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+          })()`, false);
+          console.warn('[cdp] 检测到按钮卡死(disabled + DOM 有内容)，已重发 input 事件强制 React 同步');
+          stuckSince = 0; // 重置，下次再卡再触发
+        }
+      } else {
+        stuckSince = 0;
       }
       if (st && st.ready) {
         await this.evalJS(`(function () {
@@ -554,9 +593,85 @@ class CDPController {
   // 关键差异（实测 2026-08-21）：Qwen 页面内 setTimeout 被站点脚本包装/节流，
   // CDP Runtime.evaluate + awaitPromise 等待页面定时器会永久挂起，
   // 因此注入必须**全同步**（不 await 页面 promise），框架提交状态的时间在 Node 侧等待。
+  //
+  // 关键修复（2026-08-21 现场事故）：
+  //   1) 长文本请求写入失败后，Qwen 页面 React 受控组件只同步了前 ~90 字符到 state（DOM 写入完整但 state 截断），
+  //      发送按钮永久 disabled，后续所有消息发不出去。每次注入前先彻底清空输入框。
+  //   2) Qwen 工具调用（ask_user_question 等）会弹出模态对话框接管输入框 + 禁用发送按钮，
+  //      此时 taLen=0 + sendDisabled=true。检测到该状态时，自动新建会话恢复（newSession），
+  //      避免无限 60s 超时。
   async injectText(text) {
     const t = String(text == null ? '' : text);
     if (!t) return; // 空消息无需写入
+
+    // —— 0a. 检测按钮卡死（sendDisabled=true 持续）→ 自动新建会话恢复 ——
+    // 触发场景（2026-08-21 现场事故）：
+    //   A) 工具调用模态对话框（taLen=0 + sendDisabled=true）：Qwen 弹 ask_user_question 等模态
+    //   B) React state 卡死（taLen>0 + sendDisabled=true）：长文本截断后按钮永远 disabled
+    //   C) 任何 sendDisabled=true 持续 1s 以上的状态（页面其它异常）
+    // 对所有情况，都主动 newSession（点击新建对话按钮）恢复新输入框 + 干净状态。
+    const stuck0 = await this.evalJS(`(function () {
+      var el = document.querySelector('[contenteditable="true"], textarea');
+      if (!el) return { taLen: -1, sendDisabled: null };
+      var txt = (el.isContentEditable ? (el.innerText || '') : (el.value || '')).trim();
+      var btns = Array.from(document.querySelectorAll('button'));
+      var b = btns.find(function (x) {
+        var label = (x.getAttribute('aria-label') || '') + ' ' + (x.textContent || '');
+        return /发送|send/i.test(label);
+      });
+      return { taLen: txt.length, sendDisabled: b ? b.disabled : null };
+    })()`, false);
+    if (stuck0 && stuck0.sendDisabled === true) {
+      // 再观察 800ms 确认是持续卡死（不是框架提交中的瞬时 disabled）
+      await sleep(800);
+      const stuck1 = await this.evalJS(`(function () {
+        var btns = Array.from(document.querySelectorAll('button'));
+        var b = btns.find(function (x) {
+          var label = (x.getAttribute('aria-label') || '') + ' ' + (x.textContent || '');
+          return /发送|send/i.test(label);
+        });
+        return b ? b.disabled : null;
+      })()`, false);
+      if (stuck1 === true) {
+        console.warn(`[cdp] 检测到按钮持续卡死(sendDisabled=true 持续 ≥ 800ms, taLen=${stuck0.taLen})，自动新建会话恢复`);
+        try {
+          await this.newSession();
+          await this.waitPageReady();
+          console.log('[cdp] 自动新建会话完成，继续注入');
+        } catch (e) {
+          console.error(`[cdp] 自动新建会话失败: ${e.message}`);
+          throw new Error(`Qwen 页面按钮卡死且新建会话失败：${e.message}。请在 Chrome 手动刷新 chat.qwen.ai 后重试`);
+        }
+      }
+    }
+
+    // —— 0b. 先清空输入框（包括残留内容 + 强制 React state 同步）——
+    // contenteditable 用 Range select-all + execCommand('delete')；textarea 用原生 setter。
+    // 不管输入框当前是否有内容，都必须走这一步：清掉前次残留 + 让 React 知道"现在为空"。
+    await this.evalJS(`(function () {
+      var el = document.querySelector('[contenteditable="true"], textarea');
+      if (!el) return;
+      el.focus();
+      if (el.isContentEditable) {
+        var sel = window.getSelection();
+        if (sel) {
+          var range = document.createRange();
+          range.selectNodeContents(el);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand('delete', false);
+        }
+      } else {
+        var set = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+        set.call(el, '');
+      }
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+      return true;
+    })()`, false);
+    // 节点侧短暂等待清空提交到 state
+    await sleep(120);
+
+    // —— 1. 写入新文本（与原逻辑一致：原生命令插入 + 派发 input）——
     const textArg = JSON.stringify(t); // 独立序列化，避免模板字面量被消息中的反引号破坏
     const expr =
       `(function (text) {

@@ -29,7 +29,7 @@ function buildToolInstruction(tools, toolChoice) {
       base +
       `\n\n你必须调用一个工具来完成任务。请仅输出一行，格式严格为：\n` +
       `${TOOL_CALL_OPEN}{"name":"工具名","arguments":{...}}${TOOL_CALL_CLOSE}\n` +
-      `不要输出任何其他文字。`
+      `不要输出任何其他文字。特别强调：在回复输出中TOOL_CALL 前后都一定要有下横线。`
     );
   }
 
@@ -40,7 +40,7 @@ function buildToolInstruction(tools, toolChoice) {
       base +
       `\n\n你必须调用工具「${name}」。请仅输出一行，格式严格为：\n` +
       `${TOOL_CALL_OPEN}{"name":"${name}","arguments":{...}}${TOOL_CALL_CLOSE}\n` +
-      `不要输出任何其他文字。`
+      `不要输出任何其他文字。特别强调：在回复输出中TOOL_CALL 前后都一定要有下横线。`
     );
   }
 
@@ -50,7 +50,7 @@ function buildToolInstruction(tools, toolChoice) {
     `\n\n调用规则：\n` +
     `- 若需要调用工具，请仅输出一行，格式严格为：\n` +
     `  ${TOOL_CALL_OPEN}{"name":"工具名","arguments":{...}}${TOOL_CALL_CLOSE}\n` +
-    `  不要输出任何其他文字。\n` +
+    `  不要输出任何其他文字。特别强调：在回复输出中TOOL_CALL 前后都一定要有下横线。\n` +
     `- 若不需要工具，请正常回答即可。`
   );
 }
