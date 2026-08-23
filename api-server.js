@@ -45,6 +45,13 @@ function genSessionId() {
   return `session_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 }
 
+// —— 工具结果续轮：参照 qwen-cdp 的简化语义（透明管道，无状态）——
+// 续轮判定只看"最后一条消息是不是 role:tool"：是 → 把该条结果（仅一条）键入页面供模型继续；
+// 否则按"最后一条 user 消息"处理。桥不做任何状态跟踪（无 pending 闸门、无防重键入、无 400
+// 拦截）——这些"聪明"逻辑曾在客户端 agent 卡死循环时误伤：要么把客户端执行错误当有效结果
+// 回灌页面，要么返回 400 让客户端把工具确认当作"被拒"而自动跳过，最终卡死在等待确认点。
+// 桥只做忠实中继：客户端发什么就键入什么，网页回什么就原样回传，控制权始终在客户端。
+
 // —— OpenAI 标准错误结构 ——
 function sendOpenAIError(res, status, type, message, code) {
   return res.status(status).json({ error: { message, type, code: code || 'error' } });
@@ -88,6 +95,16 @@ async function processQueue() {
   processing = false;
 }
 
+// —— 工具结果续轮处理见 handleCompletions（透明中继，无 forceFinal，参照 qwen-cdp）——
+// 设计约束：本桥"不"代替客户端执行或决策工具（不做服务端自动工具循环、不做状态跟踪、不做
+// 400 拦截——这些"聪明"逻辑曾误伤：把客户端执行错误当有效结果回灌、或让客户端把工具确认
+// 当"被拒"而自动跳过，最终卡死在等待确认点）。续轮判定参照 qwen-cdp：只看"最后一条消息是
+// 不是 role:tool"，是 → 把该条结果键入页面供模型继续；否则取最后一条 user 消息发送。
+// 工具由客户端（WorkBuddy / DSH）在其自身环境执行；客户端确认后把 role:"tool" 结果回传，
+// 桥仅把它键入网页，按网页真实返回原样中继给客户端：若网页仍产出 tool_calls 则回传
+// tool_calls（由客户端决定下一步），否则 stop。桥只是透明管道，客户端发什么就键入什么、
+// 网页回什么就回传什么，控制权始终在客户端。
+
 // =====================================================================
 // OpenAI / DeepSeek 标准接口：POST /v1/chat/completions（及 /chat/completions）
 // =====================================================================
@@ -117,12 +134,52 @@ async function handleCompletions(req, res) {
   // 先做新建会话决策并记录，确保握手回合与后续回合归属同一网页会话（注入的提示词才能留在历史里）
   const newSession = decideNewSession(hasClientSessionId ? sessionId : null, body.new_session);
   if (hasClientSessionId) lastSessionId = sessionId;
+  // CDP 透传选项（newSession + 原始请求型号名，供后端按名称关键词尽力切换网页模式）
+  const opts = { newSession, model: route.requested };
+  // 注意：tool_executor 字段本桥不再使用（工具由客户端自行执行，桥不替客户端决策/执行）。
 
-  // —— 工具系统提示词按需注入（HI,TOOLS 会话级一次性）——
+  // —— 控制指令 NEW.TOPIC（spec 3.3）：静默新建网页会话并回显 "NEW.TOPIC"，不把指令发给模型 ——
+  // 与 HI,TOOLS 同构：fire-and-forget 在串行队列中新建网页会话，确认回执立即返回；
+  // 下一条消息排在新建之后执行，天然落在新建的网页会话里。
+  if (tooluse.detectNewTopic(messages)) {
+    enqueue(async () => {
+      try {
+        await cdp.ensureConnected();
+        await cdp.newSession(); // 仅新建网页会话，不发送任何文本
+        console.log(`[api] NEW.TOPIC 已新建网页会话 ${sessionId}`);
+      } catch (e) {
+        console.error(`[api] NEW.TOPIC 新建会话失败: ${e.message}`);
+      }
+    });
+    if (stream) {
+      const created = Math.floor(Date.now() / 1000);
+      const chatId = `chatcmpl-${sessionId}`;
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      });
+      res.write(
+        `data: ${JSON.stringify({ id: chatId, object: 'chat.completion.chunk', created, model: modelOut, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })}\n\n`
+      );
+      res.write(
+        `data: ${JSON.stringify({ id: chatId, object: 'chat.completion.chunk', created, model: modelOut, choices: [{ index: 0, delta: { content: 'NEW.TOPIC' }, finish_reason: null }] })}\n\n`
+      );
+      res.write(
+        `data: ${JSON.stringify({ id: chatId, object: 'chat.completion.chunk', created, model: modelOut, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`
+      );
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+    return res.json(buildCompletion(modelOut, sessionId, '', 'NEW.TOPIC'));
+  }
+
+  // —— 工具系统提示词按需注入（HI,TOOLS 会话级一次性，见 spec 3.7）——
   // 识别到指令 "HI,TOOLS" → **带上系统提示词发送 "HI" 消息**（发给网页模型的内容 =
   // 系统提示词 + "HI"，一次）；此后本会话一直不再带系统提示词发送。
   // 未发过该指令的会话则一直不发送系统提示词。
-  // 握手走后台队列 fire-and-forget（不阻塞 "HI" 回复）；同一会话重复 HI,TOOLS 只发 "HI" 不带提示词。
+  // 2026-08-21 调整：本回合不再伪造 "HI" 确认应答，而是把 HI 真正发给网页后，
+  // 返回**网页的真实回复**（流式按增量推送）；指令本身只负责触发系统提示词添加。
   if (tooluse.detectToolArm(messages)) {
     const toolsOk = Array.isArray(tools) && tools.length > 0 && tool_choice !== 'none';
     const firstTime = !tooluse.isPromptInjected(sessionId);
@@ -136,13 +193,25 @@ async function handleCompletions(req, res) {
     }
     enqueue(async () => {
       try {
-        await cdp.executeChat(sessionId, handshake, { newSession, model: route.requested });
-        console.log(`[api] HI,TOOLS 握手已发送会话 ${sessionId}：${handshake === 'HI' ? '仅 HI（无系统提示词）' : `系统提示词(1次)+HI，工具 ${tools.length} 个`}`);
-      } catch (e) {
-        console.warn('[api] HI,TOOLS 握手发送失败:', e.message);
+        if (stream) {
+          // 把网页对 "HI"（含系统提示词）的真实回复按增量流式推送
+          await handleStreaming(req, res, { model: modelOut, sessionId, message: handshake, opts });
+        } else {
+          const result = await cdp.executeChat(sessionId, handshake, opts);
+          res.json(buildCompletion(modelOut, sessionId, handshake, result.content));
+        }
+        console.log(`[api] HI,TOOLS 已发送会话 ${sessionId}：${handshake === 'HI' ? '仅 HI（无系统提示词）' : `系统提示词(1次)+HI，工具 ${tools.length} 个`}`);
+      } catch (err) {
+        console.error(`[api] HI,TOOLS 会话 ${sessionId} 失败: ${err.message}`);
+        if (!res.headersSent) {
+          sendOpenAIError(res, 500, 'server_error', err.message, 'cdp_error');
+        } else if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'server_error', code: 'cdp_error' } })}\n\n`);
+          res.end();
+        }
       }
     });
-    return sendToolArmAck(res, modelOut, sessionId, stream);
+    return;
   }
 
   // 工具调用模式：tools 非空。注意：**这里不再注入**工具系统提示词——它只在
@@ -151,32 +220,50 @@ async function handleCompletions(req, res) {
 
   // 计算要键入页面的文本（outgoing）
   let outgoing;
-  if (toolMode) {
-    const last = messages[messages.length - 1];
-    if (last && last.role === 'tool') {
-      // 上一轮工具结果回传：标注后键入页面，供模型继续
-      const tname = tooluse.resolveToolName(messages, last.tool_call_id);
-      const tcontent = typeof last.content === 'string' ? last.content : JSON.stringify(last.content);
-      outgoing = `【工具「${tname}」的返回结果如下，请据此继续完成任务】\n${tcontent}`;
-    } else {
-      const u = [...messages].reverse().find(
-        (m) => m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()
-      );
-      if (!u) {
-        return sendOpenAIError(res, 400, 'invalid_request_error', 'tools 模式下缺少有效的 user 消息', 'missing_user_message');
-      }
-      outgoing = u.content;
+  // —— 工具结果续轮（参照 qwen-cdp 简化语义，无状态透明中继）——
+  // 只要"最后一条消息"是 role:tool，就把该条结果（仅一条）键入页面供模型继续；
+  // 否则取最后一条 user 消息作为发送内容。桥不做任何状态跟踪、不做拦截：
+  // 客户端发什么就键入什么、网页回什么就回传什么，控制权始终在客户端。
+  const lastMsg = messages[messages.length - 1];
+  const isToolContinuation = !!(lastMsg && lastMsg.role === 'tool' && lastMsg.content != null);
+
+  if (isToolContinuation) {
+    const tname = tooluse.resolveToolName(messages, lastMsg.tool_call_id);
+    const tcontent = typeof lastMsg.content === 'string' ? lastMsg.content : JSON.stringify(lastMsg.content);
+    outgoing = `【工具「${tname}」的返回结果如下，请据此继续完成任务】\n${tcontent}`;
+  } else if (toolMode) {
+    const u = [...messages].reverse().find(
+      (m) => m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()
+    );
+    if (!u) {
+      return sendOpenAIError(res, 400, 'invalid_request_error', 'tools 模式下缺少有效的 user 消息', 'missing_user_message');
     }
+    // 提取 <user_query> 包裹的真实消息（见 spec 3.8），剥离 WorkBuddy 附加系统提示词
+    outgoing = tooluse.extractUserQuery(u.content);
   } else {
     // 取最后一条 user 消息作为发送内容（system 等角色会被忽略——网页版有自身预设）
     const lastUser = [...messages].reverse().find((m) => m && (m.role === 'user' || m.content));
     if (!lastUser || typeof lastUser.content !== 'string' || !lastUser.content.trim()) {
       return sendOpenAIError(res, 400, 'invalid_request_error', 'messages 中缺少有效的 user 消息', 'missing_user_message');
     }
-    outgoing = lastUser.content;
+    // 提取 <user_query> 包裹的真实消息（见 spec 3.8），剥离 WorkBuddy 附加系统提示词
+    outgoing = tooluse.extractUserQuery(lastUser.content);
   }
 
-  const opts = { newSession, model: route.requested }; // 透传原始请求型号名，供后端按名称关键词（reasoner/r1/search）尽力切换网页模式
+  // —— 诊断日志：把真正键入页面的 outgoing 打出来，定位"脏内容污染"（如整段客户端消息被原样键入）——
+  const _srcForDiag = isToolContinuation
+    ? '(tool-result 续轮)'
+    : toolMode
+    ? (() => { const u = [...messages].reverse().find((m) => m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()); return u ? u.content : ''; })()
+    : (() => { const lu = [...messages].reverse().find((m) => m && (m.role === 'user' || m.content)); return lu ? lu.content : ''; })();
+  const _hasTag = /<user_query>[\s\S]*?<\/user_query>/i.test(_srcForDiag || '');
+  console.log(
+    `[api][diag] mode=${isToolContinuation ? 'tool-cont' : toolMode ? 'tools' : 'normal'}` +
+    ` lastRole=${lastMsg ? lastMsg.role : '(空)'}` +
+    ` outgoingLen=${outgoing ? outgoing.length : 0}` +
+    ` srcHasUserQueryTag=${_hasTag}` +
+    ` outgoingHead=${JSON.stringify((outgoing || '').slice(0, 200))}`
+  );
 
   console.log(
     `[api] 收到请求(${stream ? 'stream' : 'json'}) sessionId=${sessionId}` +
@@ -185,9 +272,15 @@ async function handleCompletions(req, res) {
     ` new_session=${newSession}${newSession && hasClientSessionId ? '（会话切换自动检测）' : ''}`
   );
 
+  // 工具结果续轮 / 工具模式统一走"透明中继"路径：把 outgoing 键入网页，按网页真实返回
+  // 决定是否回传 tool_calls——若网页仍想调用工具，则原样回传 tool_calls（finish_reason:
+  // "tool_calls"），由客户端自行决定是否执行、如何执行；若网页给出最终答案则 stop。
+  // 本桥绝不替客户端决策（不强制"不要再调用工具"、不隐藏 tool_calls、不自动执行工具）。
+  const useToolPath = isToolContinuation || toolMode;
+
   enqueue(async () => {
     try {
-      if (toolMode) {
+      if (useToolPath) {
         if (stream) {
           // 流式工具模式：正文实时吐出，工具调用块闭合后才 flush（详见 streamToolMode）
           await streamToolMode(res, modelOut, sessionId, outgoing, opts);
@@ -241,36 +334,6 @@ function buildCompletion(model, sessionId, prompt, content) {
       total_tokens: Math.max(2, Math.ceil((prompt.length + content.length) / 1.5)),
     },
   };
-}
-
-// 工具启用指令 HI,TOOLS 的轻量确认响应：不调用网页模型、不污染网页会话，
-// 仅回一个 OpenAI 标准完成（或 SSE），正文为 "HI"，表示本会话武器已打开。
-function sendToolArmAck(res, model, sessionId, stream) {
-  const ack = 'HI';
-  if (stream) {
-    const created = Math.floor(Date.now() / 1000);
-    const chatId = `chatcmpl-${sessionId}`;
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    });
-    res.write(
-      `data: ${JSON.stringify({
-        id: chatId, object: 'chat.completion.chunk', created, model,
-        choices: [{ index: 0, delta: { role: 'assistant', content: ack }, finish_reason: null }],
-      })}\n\n`
-    );
-    res.write(
-      `data: ${JSON.stringify({
-        id: chatId, object: 'chat.completion.chunk', created, model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      })}\n\n`
-    );
-    res.write('data: [DONE]\n\n');
-    return res.end();
-  }
-  return res.json(buildCompletion(model, sessionId, '', ack));
 }
 
 // —— 工具调用（tool_calls）相关构造 ——

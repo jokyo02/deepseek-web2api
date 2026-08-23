@@ -109,6 +109,19 @@ class CDPController {
 
     this.connected = true;
     console.log(`[cdp] 已连接页面: ${page.url}`);
+
+    // 关键修复（2026-08-23）：启动时立即新建一个「干净」DeepSeek 会话，
+    // 绝不沿用用户手动打开的、可能含无关历史的会话（如 562200df「优先使用工具」等测试对话）。
+    // 否则那些历史会被 DeepSeek 当成上下文续写，导致回答被污染（例如吐出与 AskUserQuestion 相关的胡话）。
+    // 用户原有的历史对话不会丢失（仅新建一个空白会话），属非破坏性操作。best-effort：失败仅告警。
+    try {
+      await this.newSession();
+      const fresh = await this.evalJS('location.href');
+      console.log(`[cdp] 已为桥创建干净会话（脱离手动历史）: ${fresh}`);
+    } catch (e) {
+      console.warn(`[cdp] 启动时新建干净会话失败（忽略，沿用当前会话）: ${e.message}`);
+    }
+
     return this.client;
   }
 
@@ -213,30 +226,48 @@ class CDPController {
       console.warn(`[cdp] API 创建会话失败，回退按钮方式: ${e.message}`);
     }
 
-    const clicked = await this.evalJS(`(() => {
-      const btns = Array.from(document.querySelectorAll('[role="button"]'));
-      const b = btns[2];
-      if (b) { b.click(); return true; }
-      return false;
-    })()`);
-
-    if (clicked) {
-      const needUrlChange = before.indexOf('chat/s/') !== -1;
-      if (needUrlChange) {
-        const deadline = Date.now() + 8000;
-        while (Date.now() < deadline) {
-          const now = await this.evalJS('location.href');
-          if (now !== before) break;
-          await sleep(400);
-        }
-      }
-    } else {
-      await this.client.Page.navigate({ url: 'https://chat.deepseek.com/' });
+    // 按钮方式：点击"新建对话"按钮（DeepSeek 该按钮点击后跳到根路径=新对话）
+    const ok = await this.clickNewChatButton();
+    if (ok) {
+      await this.waitPageReady();
+      const after = await this.evalJS('location.href');
+      console.log(`[cdp] 已新建会话(按钮): ${before} -> ${after}`);
+      return;
     }
+    // 兜底：直接导航到根路径
+    await this.client.Page.navigate({ url: 'https://chat.deepseek.com/' });
 
     await this.waitPageReady();
     const after = await this.evalJS('location.href');
-    console.log(`[cdp] 已新建会话: ${before} -> ${after}`);
+    console.log(`[cdp] 已新建会话(导航兜底): ${before} -> ${after}`);
+  }
+
+  // 点击"新建对话"按钮：DeepSeek 的按钮 class 为混淆名、无文字/aria 标签，无法用静态选择器定位。
+  // 改为行为探测：遍历少量候选 [role="button"]，点哪个会让 URL 跳到根路径（/a/chat/s/ 消失）即命中。
+  // 命中返回 true；点错（URL 未变，或变化但非根路径）则还原现场后继续尝试。
+  async clickNewChatButton() {
+    const candidates = [5, 2, 3, 4, 6, 7, 8];
+    for (const idx of candidates) {
+      const before = await this.evalJS('location.href');
+      const clicked = await this.evalJS(
+        `(() => { const b = Array.from(document.querySelectorAll('[role="button"]'))[${idx}]; if (b) { b.click(); return true; } return false; })()`
+      );
+      if (!clicked) continue;
+      await sleep(1200);
+      const after = await this.evalJS('location.href');
+      if (after && !/chat\/s\//.test(after)) {
+        // URL 跳到根路径（已离开旧会话 = 新对话），命中
+        return true;
+      }
+      // 否则还原现场，尝试下一个候选
+      if (after !== before) {
+        try {
+          await this.client.Page.navigate({ url: before });
+          await sleep(800);
+        } catch (_) {}
+      }
+    }
+    return false;
   }
 
   // 按模型名称尽力切换网页模式（深度思考 R1 / 联网搜索）。
@@ -274,22 +305,30 @@ class CDPController {
 
   // 在页面上下文调用 DeepSeek 会话创建接口，返回新会话 id（失败返回 null）
   async createSessionViaAPI() {
-    const raw = await this.evalJS(
-      `(async () => {
-        const resp = await fetch('/api/v0/chat_session/create', { method: 'POST' });
-        const j = await resp.json();
-        return JSON.stringify(j);
-      })()`,
-      true
-    );
-    let j;
     try {
-      j = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const raw = await this.evalJS(
+        `(async () => {
+          try {
+            const resp = await fetch('/api/v0/chat_session/create', { method: 'POST' });
+            const j = await resp.json();
+            return JSON.stringify(j);
+          } catch (e) { return JSON.stringify({ __err: String(e) }); }
+        })()`,
+        true
+      );
+      let j;
+      try {
+        j = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      } catch (_) {
+        return null;
+      }
+      // 裸 fetch 不带鉴权头（Missing Token / code!=0 等）→ 走按钮兜底，属预期，不报错
+      if (!j || j.__err || (typeof j.code === 'number' && j.code !== 0)) return null;
+      const id = j.data && j.data.biz_data && j.data.biz_data.chat_session && j.data.biz_data.chat_session.id;
+      return typeof id === 'string' && id ? id : null;
     } catch (_) {
       return null;
     }
-    const id = j && j.data && j.data.biz_data && j.data.biz_data.chat_session && j.data.biz_data.chat_session.id;
-    return typeof id === 'string' && id ? id : null;
   }
 
   // 等待页面就绪：加载完成 + 输入框可用 + SPA 初始化完成（API 请求静默 2s）
@@ -417,17 +456,28 @@ class CDPController {
     console.log(`[cdp] 已触发发送 (${sent})`);
   }
 
-  // 触发发送：粘贴/注入后，框架（React 等）需要一小段时间把内容提交到内部状态，
-  // 此时按钮虽「看起来」可点，点击却无效。因此这里在 maxWaitMs 预算内持续轮询：
-  //   - 输入框已清空 → 视为发送成功（之前任一次点击已生效）
-  //   - 内容已就绪（有文本且按钮可点）→ 点击发送；然后等待并检查是否清空
-  //   - 未清空则继续等待/重试点击，直到预算耗尽或真正发送成功
-  // 预算耗尽仍失败 → 最后回退 Enter 键。
-  async triggerSend(maxWaitMs = 3000, pollMs = 250) {
+  // 触发发送：粘贴/注入后，框架（React 等）需要一小段时间把内容提交到内部状态。
+  // 在 maxWaitMs 预算内持续轮询：
+  //   - 输入框已清空 → 视为发送成功
+  //   - 内容已就绪（有文本且按钮可点）→ 按编辑器类型选择主路径：
+  //       * TEXTAREA（如 DeepSeek 新版）：优先走 Enter 键（按钮点击常因 React 受控状态竞态失效）
+  //       * contenteditable：优先走按钮点击
+  //     主路径连续失败则自动切换另一种方式兜底，直到预算耗尽。
+  async triggerSend(maxWaitMs = 4000, pollMs = 300) {
     const deadline = Date.now() + maxWaitMs;
-    let attempt = 0;
+    let clickTries = 0;
+    let enterTries = 0;
+    const clickSend = () =>
+      this.evalJS(`(function () {
+        var btns = Array.from(document.querySelectorAll('button'));
+        for (var b of btns) {
+          var label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
+          if (/发送|send/i.test(label)) { b.click(); return; }
+        }
+        var sb = document.querySelector('button[data-testid*="send"]');
+        if (sb) sb.click();
+      })()`);
     while (Date.now() < deadline) {
-      attempt++;
       const st = await this.evalJS(`(function () {
         function findSend() {
           var btns = Array.from(document.querySelectorAll('button'));
@@ -443,55 +493,56 @@ class CDPController {
         return {
           empty: txt.length === 0,
           ready: txt.length > 0 && (!b || !b.disabled),
+          isTextarea: !!(el && el.tagName === 'TEXTAREA'),
         };
       })()`);
       if (st && st.empty) {
         console.log('[cdp] 输入框已清空，发送成功');
-        return 'click';
+        return 'send';
       }
       if (st && st.ready) {
-        await this.evalJS(`(function () {
-          var btns = Array.from(document.querySelectorAll('button'));
-          for (var b of btns) {
-            var label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
-            if (/发送|send/i.test(label)) { b.click(); return; }
+        if (st.isTextarea) {
+          // TEXTAREA：优先 Enter（DeepSeek 以 Enter 提交、Shift+Enter 换行）
+          if (enterTries < 2) {
+            enterTries++;
+            await this.enterFallback();
+            console.log(`[cdp] 已通过 Enter 尝试发送（第 ${enterTries} 次）`);
+            await sleep(700);
+            continue;
           }
-          var sb = document.querySelector('button[data-testid*="send"]');
-          if (sb) sb.click();
-        })()`);
-        console.log(`[cdp] 已点击发送（第 ${attempt} 次尝试）`);
-        await sleep(900); // 等待框架处理并清空输入框（避免误判未发送而重复点击）
-        continue;
+          if (clickTries < 2) {
+            clickTries++;
+            await clickSend();
+            console.log(`[cdp] Enter 未生效，改点击发送（第 ${clickTries} 次）`);
+            await sleep(800);
+            continue;
+          }
+        } else {
+          // contenteditable：优先按钮点击
+          if (clickTries < 3) {
+            clickTries++;
+            await clickSend();
+            console.log(`[cdp] 已点击发送（第 ${clickTries} 次尝试）`);
+            await sleep(800);
+            continue;
+          }
+          if (enterTries < 2) {
+            enterTries++;
+            await this.enterFallback();
+            console.log(`[cdp] 点击未生效，改 Enter 发送（第 ${enterTries} 次）`);
+            await sleep(700);
+            continue;
+          }
+        }
       }
       // 内容未就绪（输入框空 / 按钮 disabled）→ 继续等待框架提交状态
       await sleep(pollMs);
     }
-    // 预算耗尽前最后一次点击可能已生效（清空发生在 deadline 之后极短时间内），最终确认一次
-    const finalEmpty = await this.evalJS(`(function () {
-      var el = document.querySelector('[contenteditable="true"], textarea');
-      if (!el) return true;
-      var t = el.isContentEditable ? (el.innerText || '').trim() : (el.value || '').trim();
-      return t.length === 0;
-    })()`);
-    if (finalEmpty) {
-      console.log('[cdp] 输入框已清空，发送成功（预算边缘）');
-      return 'click';
-    }
-    // 仍未能发送：最后回退 Enter 键
-    console.log('[cdp] 预算内按钮提交未成功，回退 Enter 键');
-    const entered = await this.enterFallback();
-    if (entered) {
-      await sleep(900);
-      const cleared = await this.evalJS(`(function () {
-        var el = document.querySelector('[contenteditable="true"], textarea');
-        if (!el) return true;
-        var t = el.isContentEditable ? (el.innerText || '').trim() : (el.value || '').trim();
-        return t.length === 0;
-      })()`);
-      if (cleared) return 'enter';
-      return 'enter-timeout';
-    }
-    return 'none';
+    // 预算耗尽：强制一次 Enter 作为最终兜底
+    console.log('[cdp] 预算内提交未成功，强制回退 Enter 键');
+    await this.enterFallback();
+    await sleep(700);
+    return 'enter';
   }
 
   // 回退：在输入框聚焦后派发 Enter 键（keyCode=13），部分编辑器以此提交

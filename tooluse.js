@@ -1,30 +1,34 @@
-// tooluse.js —— 基于提示词的工具调用层（prompt-based tool use, DSML 增强版）
+// tooluse.js —— 基于提示词的工具调用层（prompt-based tool use, TOOLSXML 增强版）
 //
 // 问题背景：DeepSeek 网页版没有原生的 function-calling 协议，本桥靠"键入文本 + 读回回复"驱动模型。
 // 因此无法直接支持 OpenAI 的 tools/tool_calls。这里用一套**约定格式**让网页模型"假装"支持工具调用：
 //   1. 把工具清单 + 调用规则作为前缀注入到用户消息里（buildToolInstruction）
-//   2. 捕获模型回复，用 DSML（DeepSeek Markup Language）XML 标签抽取工具调用（parseToolOutput）
+//   2. 捕获模型回复，用 TOOLSXML（DeepSeek Markup Language）XML 标签抽取工具调用（parseToolOutput）
 //   3. 转成 OpenAI 标准 tool_calls 返回；客户端执行后把 tool 结果发回，桥接层再把结果键入页面续聊
 //
-// 设计借鉴 deepseek-web2api-free 的 DSML + StreamSieve 思路，并针对本桥做了两点关键增强：
+// 设计借鉴 deepseek-web2api-free 的 TOOLSXML + StreamSieve 思路，并针对本桥做了两点关键增强：
 //   A) content 与 tool_calls 不再互斥 —— 模型"先说一句+再调工具"时，正文与工具调用同时返回（修复旧版 XOR bug）；
 //   B) 流式场景下用 ToolStreamSieve 逐字符分离正文与工具调用，正文实时吐出，工具调用块闭合后才 flush。
 //
-// 格式（DSML）：
-//   <|DSML|tool_calls>
-//     <|DSML|invoke name="工具名">
-//       <|DSML|parameter name="参数名"><![CDATA[参数值]]></|DSML|parameter>
-//     </|DSML|invoke>
-//   </|DSML|tool_calls>
+// 格式（TOOLSXML）：
+//   <|TOOLSXML|tool_calls>
+//     <|TOOLSXML|invoke name="工具名">
+//       <|TOOLSXML|parameter name="参数名"><![CDATA[参数值]]></|TOOLSXML|parameter>
+//     </|TOOLSXML|invoke>
+//   </|TOOLSXML|tool_calls>
 //
 // 说明：这是尽力而为的方案，可靠性依赖网页模型对格式的遵循程度；非官方 API 的原生工具调用可比。
 
 'use strict';
 
-// —— DSML 标签（与 deepseek-web2api-free 的 DSML 兼容）——
-const DSML_MARK = '<|DSML|';
+// —— TOOLSXML 标签（与 deepseek-web2api-free 的 TOOLSXML 兼容）——
+const TOOLSXML_MARK = '<|TOOLSXML|';
+// 从标记中析出关键字（"TOOLSXML"），用于 stripDsmlMarkup 跳过前缀。
+// 注意：重命名 DSML→TOOLSXML 后，绝不能再用硬编码字面量 'dsml' 判断，
+// 否则 <|TOOLSXML|tool_calls> 无法归一化成 <tool_calls>，工具调用解析整体失效。
+const TOOLSXML_KEYWORD = TOOLSXML_MARK.replace(/^<\|/, '').replace(/\|$/, '');
 
-// —— 旧版定界符（向后兼容：仍保留解析能力，但注入格式已切换为 DSML）——
+// —— 旧版定界符（向后兼容：仍保留解析能力，但注入格式已切换为 TOOLSXML）——
 const TOOL_CALL_OPEN = '__TOOL_CALL__';
 const TOOL_CALL_CLOSE = '__END__';
 
@@ -35,12 +39,12 @@ function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// 模型偶发把结束标签写成 </<|DSML|X>（多写了一个 '<'）：即 </ 后面又跟了 <|DSML|。
-// 例如正常应为 </|DSML|parameter>，模型却输出 </<|DSML|parameter>。
-// 这里在解析前把它归一化为规范形式，避免整段 DSML 解析失败、原样当正文吐出。
+// 模型偶发把结束标签写成 </<|TOOLSXML|X>（多写了一个 '<'）：即 </ 后面又跟了 <|TOOLSXML|。
+// 例如正常应为 </|TOOLSXML|parameter>，模型却输出 </<|TOOLSXML|parameter>。
+// 这里在解析前把它归一化为规范形式，避免整段 TOOLSXML 解析失败、原样当正文吐出。
 function fixMalformedDsml(raw) {
   if (typeof raw !== 'string' || !raw) return raw;
-  return raw.replace(/<\/<\s*\|DSML\|/g, '</|DSML|');
+  return raw.replace(/<\/<\s*\|TOOLSXML\|/g, '</|TOOLSXML|');
 }
 
 // =====================================================================
@@ -76,17 +80,56 @@ function normalizeArmText(s) {
   return String(s || '').replace(/\s+/g, '').toUpperCase();
 }
 
-// 只识别「最后一次用户消息」：客户端可能携带多轮会话历史（其中含以前的 HI,TOOLS 指令），
-// 不能因为历史里有 HI,TOOLS 就重复触发握手——只有最新一次用户指令才算数。
-function detectToolArm(messages) {
-  if (!Array.isArray(messages)) return false;
+// 从 WorkBuddy 客户端消息中提取真实用户消息（<user_query>...</user_query> 包裹）。
+// 无标签则原样返回；有标签则返回标签内文本（不含标签本身、不含客户端附加的系统提示词）。
+// 见 spec 3.8：避免 WorkBuddy 系统提示词污染网页会话上下文；指令（HI,TOOLS / NEW.TOPIC）
+// 也只在提取后的真实消息上检测（<user_query>HI,TOOLS</user_query> 同样触发握手）。
+function extractUserQuery(content) {
+  if (typeof content !== 'string') return content;
+  // 全局匹配：WorkBuddy 可能把多轮历史打包进同一条 user 消息（含多个 <user_query> 块），
+  // 必须取「最后一个」真实用户消息，清除历史中的旧指令干扰（spec 3.8 的「只受理最后一个」）。
+  const re = /<user_query>([\s\S]*?)<\/user_query>/gi;
+  let m, last = null;
+  while ((m = re.exec(content)) !== null) last = m[1];
+  if (last !== null) return last.trim();
+  return content;
+}
+
+// 取「最后一次 user 消息」中 <user_query> 包裹的真实文本（无标签则整条 user 内容）。
+// 配合 extractUserQuery（已改为返回最后一个 <user_query> 块），实现「只受理最后一个、清除历史信息」：
+// WorkBuddy 附带的多轮历史 / 旧指令不会污染当前指令判定。
+function lastUserQuery(messages) {
+  if (!Array.isArray(messages)) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m && m.role === 'user' && typeof m.content === 'string') {
-      return normalizeArmText(m.content).includes(TOOL_ARM_COMMAND);
+      return extractUserQuery(m.content);
     }
   }
-  return false;
+  return null;
+}
+
+// 归一化 NEW.TOPIC 文本：去除所有空白与点号并转大写，稳定匹配
+// "NEW.TOPIC" / "new topic" / "NEW TOPIC" 等变体（对齐 qwen-cdp 正确实现）。
+function normalizeTopicText(s) {
+  return String(s || '').replace(/\s+/g, '').replace(/\./g, '').toUpperCase();
+}
+
+// 只识别「最后一次用户消息」中的控制指令 HI,TOOLS（spec 3.7）：
+// 与 qwen-cdp 一致用「子串宽松匹配」——HITOOLS 与 NEWTOPIC 互不包含，
+// 历史里的 NEW.TOPIC 不会误触发 HI,TOOLS 握手；反之 HI,TOOLS 也不会被误判成 NEW.TOPIC。
+function detectToolArm(messages) {
+  const last = lastUserQuery(messages);
+  return last !== null && normalizeArmText(last).includes(TOOL_ARM_COMMAND);
+}
+
+// 控制指令 NEW.TOPIC（spec 3.3）：检测最后一次用户消息是否为"新建会话"指令。
+// 关键：用**精确相等** `=== 'NEWTOPIC'`（对齐 qwen-cdp），而非子串 / 双向严格匹配——
+// 这样即使历史里残留 NEW.TOPIC，只要最后一条当前消息是 HI,TOOLS（归一化 HITOOLS），
+// 就绝不会误判为 NEW.TOPIC；只有当最后一条消息本身就是 NEW.TOPIC 才命中。
+function detectNewTopic(messages) {
+  const last = lastUserQuery(messages);
+  return last !== null && normalizeTopicText(last) === 'NEWTOPIC';
 }
 
 // 从用户内容中剥离 HI,TOOLS 控制指令（保留真实提问），避免把控制词键入网页模型
@@ -108,22 +151,22 @@ function buildToolInstruction(tools, toolChoice) {
   const toolList = (tools || []).map(formatToolBrief).join('\n');
 
   const formatRules = [
-    '你具备调用外部工具的能力。当需要调用工具时，请严格按以下 XML 格式输出',
+    '你具备调用外部工具的能力，要优先考虑使用工具展开工作。当需要调用工具时，请严格按以下 XML 格式输出',
     '（不要加代码围栏、不要在工具调用块之外写多余的解释性文字）：',
     '',
-    `${DSML_MARK}tool_calls>`,
-    `  ${DSML_MARK}invoke name="工具名">`,
-    `    ${DSML_MARK}parameter name="参数名"><![CDATA[参数值]]></${DSML_MARK}parameter>`,
-    `  </${DSML_MARK}invoke>`,
-    `</${DSML_MARK}tool_calls>`,
+    `${TOOLSXML_MARK}tool_calls>`,
+    `  ${TOOLSXML_MARK}invoke name="工具名">`,
+    `    ${TOOLSXML_MARK}parameter name="参数名"><![CDATA[参数值]]></${TOOLSXML_MARK}parameter>`,
+    `  </${TOOLSXML_MARK}invoke>`,
+    `</${TOOLSXML_MARK}tool_calls>`,
     '',
     '规则：',
-    '- 用 <|DSML|tool_calls> 包裹，内部可含一个或多个 <|DSML|invoke>；',
+    '- 用 <|TOOLSXML|tool_calls> 包裹，内部可含一个或多个 <|TOOLSXML|invoke>；',
     '- 工具名写在 invoke 的 name 属性里；',
     '- 字符串参数值必须放在 <![CDATA[ ... ]]> 中；数字/布尔/null 直接写纯文本；',
     '- 工具调用块之前或之后可写自然语言说明（会作为普通回复一并返回）；',
     '- 不要把工具调用包在 ``` 代码围栏里，不要重复说明格式。',
-    '- 结束标签形如 </|DSML|parameter>（只有一对尖括号）；严禁写成 </<|DSML|parameter>（多了一个 <），否则工具调用会解析失败。',
+    '- 结束标签形如 </|TOOLSXML|parameter>（只有一对尖括号）；严禁写成 </<|TOOLSXML|parameter>（多了一个 <），否则工具调用会解析失败。',
     '',
     '可用工具：',
     toolList,
@@ -165,11 +208,11 @@ function formatToolBrief(tool) {
 }
 
 // =====================================================================
-// 2. 解析：把模型回复中的 DSML 工具调用抽取为 OpenAI tool_calls，并保留正文
+// 2. 解析：把模型回复中的 TOOLSXML 工具调用抽取为 OpenAI tool_calls，并保留正文
 // =====================================================================
 
-// 去除 <|DSML|...> 前缀标记，归一化为普通 <tag> 形式，便于后续 XML 正则解析。
-// 同时兼容 "<|DSML|invoke" / "|DSML|invoke" / "<invoke" 多种写法。
+// 去除 <|TOOLSXML|...> 前缀标记，归一化为普通 <tag> 形式，便于后续 XML 正则解析。
+// 同时兼容 "<|TOOLSXML|invoke" / "|TOOLSXML|invoke" / "<invoke" 多种写法。
 function stripDsmlMarkup(text) {
   if (!text) return text;
   let out = '';
@@ -190,15 +233,18 @@ function stripDsmlMarkup(text) {
     if (end === -1) { out += text.slice(i); break; }
     const inner = text.slice(i + 1, end);
     const rest = inner.startsWith('/') ? inner.slice(1) : inner;
-    // 检测 |DSML| 前缀（允许前导空格/换行/竖线）
+    // 检测 |TOOLSXML| 前缀（允许前导空格/换行/竖线）
     let j = 0;
     let dsml = false;
     while (j < rest.length) {
       const ch = rest[j];
       if (ch === '|') { dsml = true; j++; }
       else if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') { j++; }
-      else if (rest.slice(j, j + 4).toLowerCase() === 'dsml') { j += 4; dsml = true; }
-      else break;
+      else {
+        const kw = rest.slice(j, j + 8).toUpperCase();
+        if (kw === TOOLSXML_KEYWORD || kw === 'DSML') { j += kw.length; dsml = true; }
+        else break;
+      }
     }
     if (dsml) {
       let nameEnd = j;
@@ -282,7 +328,7 @@ function cleanDsmlText(normalized) {
   return t.trim();
 }
 
-// 解析 DSML：返回 { toolCalls, text }
+// 解析 TOOLSXML：返回 { toolCalls, text }
 function parseDsmlToolCalls(content) {
   if (!content || typeof content !== 'string') return { toolCalls: [], text: '' };
   const normalized = stripDsmlMarkup(fixMalformedDsml(content));
@@ -373,7 +419,7 @@ function parseToolOutput(content) {
   if (!content || typeof content !== 'string') return { toolCalls: [], text: '' };
 
   const legacyCalls = extractLegacyToolCalls(content);
-  // 先剥离旧版定界符，避免污染 DSML 解析
+  // 先剥离旧版定界符，避免污染 TOOLSXML 解析
   let working = legacyCalls.length ? stripLegacyMarkers(content) : content;
 
   const dsml = parseDsmlToolCalls(working);
@@ -505,11 +551,11 @@ class ToolStreamSieve {
 
   _isCaptureComplete() {
     const buf = fixMalformedDsml(this._captureBuf);
-    // 开启标签可能是原始 <|DSML|...> 或归一化后的 <...>；闭合标签是 </|DSML|...>（注意是 </ 不是 </<）
-    const openTool = `${DSML_MARK}tool_calls>`;   // <|DSML|tool_calls>
-    const closeTool = `</|DSML|tool_calls>`;       // </|DSML|tool_calls>
-    const openInvoke = `${DSML_MARK}invoke `;      // <|DSML|invoke 
-    const closeInvoke = `</|DSML|invoke>`;         // </|DSML|invoke>
+    // 开启标签可能是原始 <|TOOLSXML|...> 或归一化后的 <...>；闭合标签是 </|TOOLSXML|...>（注意是 </ 不是 </<）
+    const openTool = `${TOOLSXML_MARK}tool_calls>`;   // <|TOOLSXML|tool_calls>
+    const closeTool = `</|TOOLSXML|tool_calls>`;       // </|TOOLSXML|tool_calls>
+    const openInvoke = `${TOOLSXML_MARK}invoke `;      // <|TOOLSXML|invoke 
+    const closeInvoke = `</|TOOLSXML|invoke>`;         // </|TOOLSXML|invoke>
     if (buf.includes(openTool) || buf.includes('<tool_calls>')) {
       return buf.includes(closeTool) || buf.includes('</tool_calls>');
     }
@@ -521,19 +567,19 @@ class ToolStreamSieve {
 
   _findToolStart(text) {
     const starts = [
-      `${DSML_MARK}tool_calls>`,
-      `|DSML|tool_calls>`,
+      `${TOOLSXML_MARK}tool_calls>`,
+      `|TOOLSXML|tool_calls>`,
       '<tool_calls>',
       '<tool_call>',
       '<invoke ',
-      `${DSML_MARK}invoke `,
-      '|DSML|invoke ',
+      `${TOOLSXML_MARK}invoke `,
+      '|TOOLSXML|invoke ',
     ];
     for (const tag of starts) {
       let pos = text.indexOf(tag);
       while (pos >= 0) {
-        // 跳过 </<|DSML|... 这种「结束标签里又嵌了一个 <」的误匹配：
-        // 例如 </<|DSML|tool_calls> 内含 <|DSML|tool_calls>，但该位置其实是结束标签
+        // 跳过 </<|TOOLSXML|... 这种「结束标签里又嵌了一个 <」的误匹配：
+        // 例如 </<|TOOLSXML|tool_calls> 内含 <|TOOLSXML|tool_calls>，但该位置其实是结束标签
         if (pos >= 2 && text[pos - 2] === '<' && text[pos - 1] === '/') {
           pos = text.indexOf(tag, pos + 1);
           continue;
@@ -541,7 +587,7 @@ class ToolStreamSieve {
         return pos;
       }
     }
-    const prefixes = [`${DSML_MARK}`, '|DSML|', '<tool_calls', '<tool_call', '<invoke'];
+    const prefixes = [`${TOOLSXML_MARK}`, '|TOOLSXML|', '<tool_calls', '<tool_call', '<invoke'];
     for (const p of prefixes) {
       const pos = text.indexOf(p);
       if (pos >= 0) return pos;
@@ -558,15 +604,15 @@ class ToolStreamSieve {
     const tail = text.slice(lastSpecial);
     if (!tail) return [text, ''];
     const starts = [
-      `${DSML_MARK}tool_calls>`,
-      `|DSML|tool_calls>`,
+      `${TOOLSXML_MARK}tool_calls>`,
+      `|TOOLSXML|tool_calls>`,
       '<tool_calls>',
       '<tool_call>',
       '<invoke ',
-      `${DSML_MARK}invoke `,
-      '|DSML|invoke ',
+      `${TOOLSXML_MARK}invoke `,
+      '|TOOLSXML|invoke ',
     ];
-    const prefixes = [`${DSML_MARK}`, '|DSML|', '<tool_calls', '<tool_call', '<invoke'];
+    const prefixes = [`${TOOLSXML_MARK}`, '|TOOLSXML|', '<tool_calls', '<tool_call', '<invoke'];
     for (const tag of starts) {
       if (tag.startsWith(tail)) return [text.slice(0, lastSpecial), tail];
     }
@@ -608,12 +654,14 @@ class ToolStreamSieve {
 }
 
 module.exports = {
-  DSML_MARK,
+  TOOLSXML_MARK,
   TOOL_CALL_OPEN,
   fixMalformedDsml,
   TOOL_CALL_CLOSE,
   TOOL_ARM_COMMAND,
   detectToolArm,
+  detectNewTopic,
+  extractUserQuery,
   stripToolArm,
   markPromptInjected,
   isPromptInjected,

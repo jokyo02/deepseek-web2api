@@ -154,6 +154,19 @@ data: [DONE]
 
 标准接口请求体加 `"new_session": true`（旧接口 `"newSession": true`）强制新建；`"new_session": false` 强制不新建（优先级高于自动检测）。
 
+**方式三：控制指令 `NEW.TOPIC`**（无需 `session_id` 字段）
+
+最后一条 user 消息内容为 `NEW.TOPIC`（大小写/空格/点号宽松匹配，`new topic`、`NEW TOPIC` 均可；`<user_query>NEW.TOPIC</user_query>` 同样触发）时，桥接层**静默新建网页会话**并回显 `NEW.TOPIC`，**不把指令转发给网页模型**。新建在串行队列中 fire-and-forget 执行：确认回执立即返回，下一条消息排在新建之后执行，天然落在新会话（上下文隔离）。注意：该指令只控制网页会话的新建，不与真实提问混在同一回合（混在一起会被当作普通消息处理）。
+
+```json
+// 单独发一条 NEW.TOPIC 指令 → 新建网页会话，回显 "NEW.TOPIC"
+{ "model": "deepseek-chat", "messages": [{ "role": "user", "content": "NEW.TOPIC" }] }
+// 然后发真实提问 → 落在新建的网页会话中
+{ "model": "deepseek-chat", "messages": [{ "role": "user", "content": "你好" }] }
+```
+
+> 实现说明：DeepSeek 网页版"新建对话"按钮的 class 为混淆名、无文字/aria 标签，无法用静态选择器定位；`newSession()` 改为行为探测——遍历少量候选 `[role="button"]`，点哪个会让页面 URL 跳到根路径（离开旧 `/a/chat/s/<id>`）即命中，点错则还原现场。裸 `fetch` 调用会话创建 API 因缺少应用动态计算的鉴权/PoW 头（`authorization`、`x-ds-pow-response` 等）会返回 `Missing Token`，故一律走按钮方式。
+
 ### 3.4 CORS（浏览器前端直接调用）
 
 服务已启用 CORS，允许任意来源的浏览器页面直接 `fetch` 本服务（含 OPTIONS 预检），前端无需走代理：
@@ -204,14 +217,14 @@ curl http://localhost:3000/v1/models
 
 ### 3.6 工具调用（Tool Use / Function Calling）
 
-DeepSeek **网页版没有原生的 function-calling 协议**（不像官方 `api.deepseek.com` API），本桥靠"键入文本 + 读回回复"驱动模型。为支持 OpenAI 的 `tools`/`tool_calls`，本服务用一套**约定格式（DSML，DeepSeek Markup Language）**让网页模型"假装"支持工具调用（见 `tooluse.js`）：
+DeepSeek **网页版没有原生的 function-calling 协议**（不像官方 `api.deepseek.com` API），本桥靠"键入文本 + 读回回复"驱动模型。为支持 OpenAI 的 `tools`/`tool_calls`，本服务用一套**约定格式（TOOLSXML，DeepSeek Markup Language）**让网页模型"假装"支持工具调用（见 `tooluse.js`）：
 
-1. 请求带 `tools` 时，桥接层把**工具清单 + 调用规则（DSML 格式说明）**作为前缀注入到用户消息里发给 DeepSeek；
-2. 捕获回复，用 DSML 标签 `<|DSML|tool_calls>` → `<|DSML|invoke name="…">` → `<|DSML|parameter name="…"><![CDATA[…]]></|DSML|parameter>` 抽取工具调用；字符串参数值放在 `<![CDATA[…]]>` 中，天然免疫引号/花括号/换行破坏；
+1. 请求带 `tools` 时，桥接层把**工具清单 + 调用规则（TOOLSXML 格式说明）**作为前缀注入到用户消息里发给 DeepSeek；
+2. 捕获回复，用 TOOLSXML 标签 `<|TOOLSXML|tool_calls>` → `<|TOOLSXML|invoke name="…">` → `<|TOOLSXML|parameter name="…"><![CDATA[…]]></|TOOLSXML|parameter>` 抽取工具调用；字符串参数值放在 `<![CDATA[…]]>` 中，天然免疫引号/花括号/换行破坏；
 3. 转成 OpenAI 标准 `tool_calls` 返回（`finish_reason: "tool_calls"`）；**正文与工具调用可共存**——模型"先说一句再调工具"时，正文会作为 `content` 一并返回（不再是旧版的互斥丢弃）；
 4. 客户端执行工具后，把 `role: "tool"` 的结果发回，桥接层把结果**键入页面**续聊，模型据此给出最终答案。
 
-> **DSML 设计借鉴** `deepseek-web2api-free` 项目的 DSML + StreamSieve 思路，并做了两点关键增强：① content 与 tool_calls 不再互斥；② 流式场景下用 `ToolStreamSieve` 逐字符分离正文与工具调用，正文实时吐出、工具调用块闭合后才 flush。
+> **TOOLSXML 设计借鉴** `deepseek-web2api-free` 项目的 TOOLSXML + StreamSieve 思路，并做了两点关键增强：① content 与 tool_calls 不再互斥；② 流式场景下用 `ToolStreamSieve` 逐字符分离正文与工具调用，正文实时吐出、工具调用块闭合后才 flush。
 
 **请求示例（带工具）：**
 
@@ -264,25 +277,50 @@ DeepSeek **网页版没有原生的 function-calling 协议**（不像官方 `ap
 > 流式（`stream: true`）同样支持：正文以 `delta.content` 增量帧**实时**吐出，工具调用以 `delta.tool_calls` 帧在块闭合后返回，结束帧 `finish_reason` 据是否存在工具调用取 `"tool_calls"` 或 `"stop"`，后跟 `[DONE]`。
 
 **注意事项（重要）：**
-- 这是**基于提示词的尽力而为方案**：可靠性取决于网页模型对 DSML 格式的遵循度；模型偶尔可能输出多余文字或漏掉格式，此时会按普通回答处理（不触发 `tool_calls`）。
+- 这是**基于提示词的尽力而为方案**：可靠性取决于网页模型对 TOOLSXML 格式的遵循度；模型偶尔可能输出多余文字或漏掉格式，此时会按普通回答处理（不触发 `tool_calls`）。
 - 注入的工具说明前缀会**出现在 DeepSeek 网页对话里**（作为可见消息的一部分），属该方案的固有代价。
 - `arguments` 由模型生成，桥接层做 JSON 解析 / CDATA 提取 / 自动类型转换（数字、布尔、null）与透传，不校验 schema；客户端应自行校验参数。
-- **向后兼容**：旧版 `__TOOL_CALL__{"name":…,"arguments":{…}}__END__` 定界符仍可被解析（仅解析兼容，注入格式已统一切换为 DSML）。
+- **向后兼容**：旧版 `__TOOL_CALL__{"name":…,"arguments":{…}}__END__` 定界符仍可被解析（仅解析兼容，注入格式已统一切换为 TOOLSXML）。
 - 普通正文若含 `<`（如 `1 < 2`）不会被误判为工具调用；异常超长未闭合的工具块会触发缓冲上限保护，强制当正文吐出，避免卡死。
-- **容错**：模型偶发把结束标签写成 `</<|DSML|parameter>`（多了一个 `<`）时，解析器会先归一化为规范的 `</|DSML|parameter>` 再解析，避免整段 DSML 泄漏为原样正文；提示词也明确警告模型不要双写 `<`。
+- **容错**：模型偶发把结束标签写成 `</<|TOOLSXML|parameter>`（多了一个 `<`）时，解析器会先归一化为规范的 `</|TOOLSXML|parameter>` 再解析，避免整段 TOOLSXML 泄漏为原样正文；提示词也明确警告模型不要双写 `<`。
+
+### 3.6.1 客户端确认续轮处理（修复「已确认却仍等待确认」）
+
+默认（也是唯一）模式下，桥把 `tool_calls` **透传**给客户端，由客户端（DSH / OpenWebUI / WorkBuddy 等）在其自身环境执行工具、再把 `role:"tool"` 的结果发回。桥**不**代替客户端执行或决策工具——工具语义、权限确认都在客户端完成。此处只解决"续轮"的协议衔接问题：
+
+**续轮处理（无状态透明中继，参照 qwen-cdp 简化语义，无 `forceFinal`/闸门/拦截）**：
+- 续轮判定：**只看"最后一条消息是不是 `role:tool`"**——是 → 把该条结果（**仅一条**，以 `【工具「name」的返回结果如下，请据此继续完成任务】` 标注）键入页面供模型继续；否则取最后一条 user 消息发送。
+- 桥**不做任何状态跟踪**（无 pending 闸门、无防重键入、无 400 拦截）：客户端发什么就键入什么、网页回什么就回传什么，控制权始终在客户端。
+- **为何不加闸门**：此前加的"待处理 tool_calls 匹配 / 重复问题 400"逻辑在客户端 agent 卡死循环时反而误伤——① 把客户端执行错误（如 `AskUserQuestion` 格式失败）当有效结果回灌页面；② 返回 400 让客户端把工具确认当作"被拒"而**自动跳过确认、卡死在等待确认点**。去掉后回归忠实中继。
+- 桥**绝不**向网页注入"不要再调用工具"等指令、**绝不**隐藏 `tool_calls`、**绝不**替客户端作答或自动执行工具。
+
+**客户端接入铁律**：
+- 第一轮（带 `tools`）：收到 `finish_reason:"tool_calls"` 即执行工具，把结果以 `role:"tool"` 发回，**不要**再用同一请求重复发原始提问；
+- 第二轮（含 `role:"tool"`）：桥按网页真实返回中继——若网页仍产出 `tool_calls` 则继续回传 `tool_calls`（客户端再次执行并回传），若网页给出最终答案则返回 `stop` + `content`，客户端据此收尾。
+
+> 注：`HI,TOOLS` 注入工具说明的回合仍需先发一次（同一 `session_id`），模型才会产出可被解析的 `tool_calls`（见 3.7）。`tool_executor` 字段本桥已不再使用（工具由客户端自执行）。
 
 ### 3.7 工具提示词按需注入：`HI,TOOLS` 会话级一次性注入（省 prompt）
 
 由于上层 agent 每次请求都携带 `tools`，若每轮都把庞大的工具说明前缀注入网页模型，对话上下文与 token 成本会显著膨胀。本桥改为**只在识别到指令 `HI,TOOLS` 时，带上系统提示词发送一次 `HI` 消息**：
 
 - **默认一直不发送**：会话从未发送过 `HI,TOOLS` 时，即使请求带 `tools`，桥接层也**不发送**工具系统提示词，网页模型按普通问答处理（不会触发 `tool_calls`）。
-- **识别到即带提示词发 `HI`**：请求中的 user 消息含 `HI,TOOLS`（大小写/空格宽松匹配，如 `HI, TOOLS`）时，桥接层把**系统提示词 + `HI` 消息**作为发给网页模型的内容（`系统提示词\n\nHI`），**仅这一次**；同时回正文 `HI`。
-- **握手为后台执行，回 `HI` 不等待**：握手消息走串行队列 fire-and-forget，`HI` 立即返回（JSON 或 SSE）。
+- **识别到即带提示词发 `HI`**：请求中的 user 消息含 `HI,TOOLS`（大小写/空格宽松匹配，如 `HI, TOOLS`）时，桥接层把**系统提示词 + `HI` 消息**作为发给网页模型的内容（`系统提示词\n\nHI`），**仅这一次**（同一 `session_id` 后续不再带）。
+- **返回网页真实回复（2026-08-21 调整）**：该回合不再由服务器伪造 `HI` 确认应答，而是把 `HI` 真正发给网页后，将**网页的真实回复**返回给客户端（流式按增量推送）。指令本身只负责触发系统提示词添加。
 - **同会话不再带提示词**：本会话（同一 `session_id`）后续所有请求（含再次发 `HI,TOOLS`）都**不再带系统提示词**——再次发 `HI,TOOLS` 只发 `HI`。系统提示词留在网页会话历史中，后续带 `tools` 的请求直接发真实提问，模型依据历史中的提示词产生 `tool_calls`。
 
 - **识别条件=最后一次用户消息**：客户端常携带多轮历史（其中含以前的 `HI,TOOLS` 指令），桥接层**只识别最后一次用户消息**——历史里的旧 `HI,TOOLS` 不会触发握手，只有最新一次用户指令是 `HI,TOOLS` 才算。
 
 > 依赖：握手归属"当前会话"——请用**相同 `session_id`** 复用在同一网页会话；若换 `session_id` 或 `new_session` 新建会话，新会话历史中没有提示词，需要在新会话里再发一次 `HI,TOOLS`（带 `tools`）。`HI,TOOLS` 应作为独立回合发送（带 `tools` 参数），若与真实提问混在同一回合，该回合会被当作握手处理、提问不转发。进程重启后注入状态清空。
+
+### 3.8 WorkBuddy 专有格式支持（`<user_query>` 标签）
+
+WorkBuddy 客户端调用时，user 消息里总是附带系统提示词，**真实用户消息由 `<user_query>...</user_query>` 标签包裹**。桥接层会自动解析该格式（`tooluse.extractUserQuery`）：
+
+- **非 `HI,TOOLS` 时只传真实消息**：发给网页模型的内容 = `<user_query>` 标签内的文本（不含客户端附加的系统提示词、不含标签本身），避免 WorkBuddy 系统提示词污染网页会话上下文。
+- **指令优先在真实消息上解析**：`NEW.TOPIC` / `HI,TOOLS` 均在提取后的真实消息上检测（`<user_query>NEW.TOPIC</user_query>` 同样触发新建会话；`<user_query>HI,TOOLS</user_query>` 同样触发握手）。
+- **`HI,TOOLS` 时注入全部系统提示词**：仅在 `HI,TOOLS` 指令回合注入工具系统提示词（见 3.7），其余回合一律不注入。
+- 无 `<user_query>` 标签的消息（普通 OpenAI 客户端）原样传递，完全兼容。
 
 ---
 
@@ -389,8 +427,8 @@ curl -N -X POST http://localhost:3000/v1/chat/completions \
 |---|---|
 | `api-server.js` | API 服务器：OpenAI 兼容端点 + 模型路由校验 + 串行队列 + 错误处理 |
 | `models.js` | 模型路由注册表：内置 `deepseek-web` + 常用别名映射 + `/v1/models` 列表（改模型只动这里） |
-| `tooluse.js` | 工具调用层（DSML）：把 OpenAI `tools` 转为 DSML 提示词注入、抽取 `<|DSML|…>` 工具调用（含 CDATA 参数解析/自动类型）、`ToolStreamSieve` 流筛分引擎、旧 `__TOOL_CALL__` 向后兼容、反查工具名 |
-| `tooluse.test.js` | 纯逻辑单元测试（无需 Chrome）：DSML 解析、CDATA 特殊字符、多 invoke、旧格式兼容、`ToolStreamSieve` 流分离；`node tooluse.test.js` 运行 |
+| `tooluse.js` | 工具调用层（TOOLSXML）：把 OpenAI `tools` 转为 TOOLSXML 提示词注入、抽取 `<|TOOLSXML|…>` 工具调用（含 CDATA 参数解析/自动类型）、`ToolStreamSieve` 流筛分引擎、旧 `__TOOL_CALL__` 向后兼容、反查工具名 |
+| `tooluse.test.js` | 纯逻辑单元测试（无需 Chrome）：TOOLSXML 解析、CDATA 特殊字符、多 invoke、旧格式兼容、`ToolStreamSieve` 流分离；`node tooluse.test.js` 运行 |
 | `cdp-controller.js` | CDP 控制器：连接页面、一次性写入文本（不粘贴/不重复录入）+ 发送、按模型切换网页模式、DOM 轮询捕获回复 |
 | `page-hook.js` | **已弃用**（早期页面内 hook 方案，死代码，可删除） |
 | `package.json` | 依赖：express、chrome-remote-interface |
