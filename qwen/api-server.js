@@ -262,7 +262,15 @@ async function handleCompletions(req, res) {
         await handleStreaming(req, res, { model: modelOut, sessionId, message: outgoing, opts });
       } else {
         const result = await cdp.executeChat(sessionId, outgoing, opts);
-        res.json(buildCompletion(modelOut, sessionId, outgoing, result.content));
+        // 无条件转换（2026-08-25）：即使请求未带 tools，只要 content 含 DSML 工具块
+        // 就解析为 tool_calls（正文与 tool_calls 可共存）；无工具块则按原始文本返回
+        // （不用 parsed.text——cleanDsmlText 会 trim 首尾空白，破坏纯文本保真）。
+        const parsed = tooluse.parseToolOutput(result.content);
+        if (parsed.toolCalls.length) {
+          res.json(buildToolCallCompletion(modelOut, sessionId, parsed.toolCalls, parsed.text));
+        } else {
+          res.json(buildCompletion(modelOut, sessionId, outgoing, result.content));
+        }
       }
     } catch (err) {
       console.error(`[api] sessionId=${sessionId} 失败: ${err.message}`);
@@ -481,6 +489,10 @@ function emitSieveEvents(res, model, chatId, created, events, state) {
 }
 
 // SSE 流式：DOM 轮询每次检测到文本增长 → 推送 delta 增量帧 → 结束帧 → [DONE]
+// 2026-08-25 改造：**无条件转换**——无论请求是否携带 tools 参数，只要内容里出现
+// DSML 工具调用块（<|DSML|tool_calls>…），一律通过 ToolStreamSieve 转成 OpenAI
+// tool_calls 事件；纯文本照常增量透传。此前无 tools 请求走纯文本透传，DSML 块被
+// 当普通正文发给客户端（前端收不到工具调用），违背"透明管道无条件转换"的约定。
 async function handleStreaming(req, res, { model, sessionId, message, opts }) {
   const created = Math.floor(Date.now() / 1000);
   const chatId = `chatcmpl-${sessionId}`;
@@ -502,37 +514,30 @@ async function handleStreaming(req, res, { model, sessionId, message, opts }) {
     })}\n\n`
   );
 
-  let lastSentLen = 0;
+  // 无条件转换：正文实时吐出；工具调用块闭合后才 flush 为 tool_calls 事件
+  const sieve = new tooluse.ToolStreamSieve((buf) => tooluse.parseToolOutput(buf));
+  const state = { hasToolCalls: false };
+  let lastLen = 0;
 
-  const result = await cdp.executeChat(sessionId, message, { ...opts, onProgress: (text) => {
-    // 推送本轮新增部分
-    if (text.length > lastSentLen) {
-      const delta = text.slice(lastSentLen);
-      lastSentLen = text.length;
-      res.write(
-        `data: ${JSON.stringify({
-          id: chatId,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-        })}\n\n`
-      );
+  const onProgress = (answer) => {
+    if (typeof answer !== 'string') return;
+    if (answer.length > lastLen) {
+      const delta = answer.slice(lastLen);
+      lastLen = answer.length;
+      emitSieveEvents(res, model, chatId, created, sieve.feed(delta), state);
     }
-  }});
+  };
 
-  // 补发未覆盖的尾部（理论上 onProgress 已全覆盖，双保险）
-  if (result.content && result.content.length > lastSentLen) {
-    res.write(
-      `data: ${JSON.stringify({
-        id: chatId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: { content: result.content.slice(lastSentLen) }, finish_reason: null }],
-      })}\n\n`
-    );
+  const result = await cdp.executeChat(sessionId, message, { ...opts, onProgress });
+
+  // 补齐：确保最终完整内容的尾部也推进了筛分器（避免 onProgress 未推送最后一截）
+  const finalText = (result && result.content) || '';
+  if (finalText.length > lastLen) {
+    emitSieveEvents(res, model, chatId, created, sieve.feed(finalText.slice(lastLen)), state);
+    lastLen = finalText.length;
   }
+  // 收尾：flush 剩余 pending / 未闭合捕获区
+  emitSieveEvents(res, model, chatId, created, sieve.flush(), state);
 
   // 结束帧
   res.write(
@@ -541,7 +546,7 @@ async function handleStreaming(req, res, { model, sessionId, message, opts }) {
       object: 'chat.completion.chunk',
       created,
       model,
-      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      choices: [{ index: 0, delta: {}, finish_reason: state.hasToolCalls ? 'tool_calls' : 'stop' }],
     })}\n\n`
   );
   res.write('data: [DONE]\n\n');

@@ -300,28 +300,47 @@ function cleanDsmlText(normalized) {
 function parseDsmlToolCalls(content) {
   if (!content || typeof content !== 'string') return { toolCalls: [], text: '' };
   const normalized = stripDsmlMarkup(fixMalformedDsml(content));
-  const toolCalls = [];
+  const rawCalls = [];
 
-  // 外层 <tool_calls> 或 <tool_call>
-  const blockMatch =
-    normalized.match(/<tool_calls>([\s\S]*?)<\/tool_calls>/i) ||
-    normalized.match(/<tool_call>([\s\S]*?)<\/tool_call>/i);
+  // 外层 <tool_calls> 或 <tool_call>：全局收集（抗翻倍——content 里可能有两个相同块）
+  const blockRe = /<tool_calls>([\s\S]*?)<\/tool_calls>/gi;
+  const blockRe2 = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
+  const blocks = [];
+  let m;
+  while ((m = blockRe.exec(normalized)) !== null) blocks.push(m[1]);
+  while ((m = blockRe2.exec(normalized)) !== null) blocks.push(m[1]);
 
   const scanInvokes = (body) => {
     const re = /<invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/invoke>/gi;
-    let m;
-    while ((m = re.exec(body)) !== null) {
-      const tc = formatToolCall(m[1].trim(), parseParameters(m[2]));
-      if (tc) toolCalls.push(tc);
+    let im;
+    while ((im = re.exec(body)) !== null) {
+      const tc = formatToolCall(im[1].trim(), parseParameters(im[2]));
+      if (tc) rawCalls.push(tc);
     }
   };
 
-  if (blockMatch) {
-    scanInvokes(blockMatch[1]);
+  if (blocks.length) {
+    for (const b of blocks) scanInvokes(b);
   } else {
     // 裸 <invoke>（无外层包裹）
     scanInvokes(normalized);
   }
+
+  // 同名工具调用去重（抗翻倍 + 抗半截块）：
+  // 翻倍会让同一工具出现两次完全相同/近似的 invoke；半截块则会先出现一个参数残缺的 invoke、
+  // 后出现完整 invoke。按 name 分组，保留参数更完整（非空、JSON 越长越完整）的一份，
+  // 避免向前端发出重复工具请求或畸形参数（前端报 Missing required top-level field）。
+  const byName = new Map();
+  for (const tc of rawCalls) {
+    const name = tc.function.name;
+    const prev = byName.get(name);
+    if (!prev) { byName.set(name, tc); continue; }
+    const score = (a) => (a && a !== '{}' ? String(a).length : 0);
+    if (score(tc.function.arguments) > score(prev.function.arguments)) {
+      byName.set(name, tc);
+    }
+  }
+  const toolCalls = Array.from(byName.values());
 
   const text = cleanDsmlText(normalized);
   return { toolCalls, text };
@@ -445,8 +464,7 @@ class ToolStreamSieve {
       }
       const result = this._tryFinish();
       if (result) {
-        this._emitResult(events, result);
-        if (result.suffix) events.push(...this._drainPending());
+        this._consumeResult(events, result);
       }
       return events;
     }
@@ -462,8 +480,7 @@ class ToolStreamSieve {
       this._capturing = true;
       const result = this._tryFinish();
       if (result) {
-        this._emitResult(events, result);
-        if (result.suffix) events.push(...this._drainPending());
+        this._consumeResult(events, result);
       }
     } else {
       const [safe, hold] = this._splitSafe(this._pending);
@@ -478,7 +495,7 @@ class ToolStreamSieve {
     if (this._capturing) {
       const result = this._tryFinish();
       if (result) {
-        this._emitResult(events, result);
+        this._consumeResult(events, result);
       } else {
         // 未闭合：整段当作正文
         events.push({ type: 'text', data: this._captureBuf });
@@ -505,16 +522,40 @@ class ToolStreamSieve {
     }
   }
 
+  // 解析成功后的统一收尾：分发事件 + 重置捕获状态 + 后缀交还 pending 流。
+  // 关键修复（2026-08-25）：旧实现各调用点 emit 后**不重置 _capturing/_captureBuf**，
+  // 导致后续每段 feed 都对同一捕获区反复 _tryFinish → tool_calls 事件重复发送；
+  // 极碎片场景还会因残缺块被宽容解析而连环重复。
+  _consumeResult(events, result) {
+    this._emitResult(events, result);
+    this._capturing = false;
+    this._captureBuf = '';
+    const suffix = (result && result.suffix) || '';
+    if (suffix) {
+      this._pending = suffix + this._pending;
+      events.push(...this._drainPending());
+    }
+  }
+
   _tryFinish() {
     if (!this._captureBuf || !this.parseFn) return null;
     if (!this._isCaptureComplete()) return null;
-    const parsed = this.parseFn(this._captureBuf);
+    // 只消费到**第一个块闭合处**：残缺的后续（如第二个块的开头）交还 pending 流继续处理。
+    // 关键修复（2026-08-25）：旧实现把整个 _captureBuf 交给 parseFn——若捕获区内还有
+    // 第二个块的残缺开头，parseToolOutput 的「裸 invoke」宽容分支会解析出残缺调用，
+    // 随后后缀又被 _drainPending 重新捕获 → 同一工具调用被发送两次。
+    const closeRe = /<\/<\|DSML\|tool_calls>|<\/\|DSML\|tool_calls>|<\/tool_calls>/i;
+    const closeM = this._captureBuf.match(closeRe);
+    const blockEnd = closeM ? closeM.index + closeM[0].length : this._captureBuf.length;
+    const blockOnly = this._captureBuf.slice(0, blockEnd);
+    const suffix = this._captureBuf.slice(blockEnd);
+    const parsed = this.parseFn(blockOnly);
     if (parsed && parsed.toolCalls && parsed.toolCalls.length) {
       // 捕获区内除工具调用外的正文也要吐出（例如工具调用之后的说明）
-      return { prefix: parsed.text || '', toolCalls: parsed.toolCalls, suffix: '' };
+      return { prefix: parsed.text || '', toolCalls: parsed.toolCalls, suffix };
     }
     // 捕获区闭合但没有工具调用：当作普通正文
-    return { text: this._captureBuf };
+    return { text: blockOnly, suffix };
   }
 
   _isCaptureComplete() {
@@ -604,8 +645,11 @@ class ToolStreamSieve {
         this._capturing = true;
         const result = this._tryFinish();
         if (result) {
+          // 与 _consumeResult 相同的状态重置（不能直接调用，避免 _drainPending 递归）
           this._emitResult(events, result);
-          if (result.suffix) continue;
+          this._capturing = false;
+          this._captureBuf = '';
+          if (result.suffix) { this._pending = result.suffix + this._pending; continue; }
           else break;
         } else {
           break;

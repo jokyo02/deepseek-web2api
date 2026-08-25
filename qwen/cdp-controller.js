@@ -90,6 +90,9 @@ class CDPController {
     this.sseLastAnswer = '';         // 上次推送的回答（onProgress 增量）
     this.sseTimer = null;            // SSE 超时定时器
     this.captureArmed = false;       // 发送后置位：下一个 API 请求作为 completion 捕获目标（武装兜底）
+    // —— 单标签页串行化（同一时刻只允许一轮对话，见 executeChat 注释）——
+    this._chain = Promise.resolve();
+    this._chainBusy = false;
   }
 
   async connect() {
@@ -176,7 +179,31 @@ class CDPController {
   }
 
   // —— 主流程：SSE 捕获 + DOM 兜底 ——
+  // 单标签页串行化闸门。
+  // 必须串行的原因（2026-08-25 实测日志）：activeSSE / sseAccum / sseTimer / captureArmed
+  //   全是**单例共享字段**。若两个请求并发（WorkBuddy 常同时发普通请求 + 带 tools 的请求）：
+  //     B 的 startSSECapture 会覆盖 A 的 activeSSE，并 clearTimeout 掉 A 的超时定时器
+  //     → A 的 Promise 既不 resolve 也不超时 → **永久挂死**；且两者还会抢同一个输入框。
+  //   这里用 Promise 链把 executeChat 排队，后到的请求等前一个彻底结束再执行。
   async executeChat(sessionId, message, opts = {}) {
+    if (this._chain && this._chainBusy) {
+      console.log(`[cdp] 页面忙，请求 ${sessionId} 排队等待上一轮对话结束`);
+    }
+    const prev = this._chain || Promise.resolve();
+    const run = prev
+      .catch(() => {}) // 前一个请求失败不影响后续排队
+      .then(() => {
+        this._chainBusy = true;
+        return this._executeChatSerial(sessionId, message, opts);
+      });
+    this._chain = run.then(
+      () => { this._chainBusy = false; },
+      () => { this._chainBusy = false; }
+    );
+    return run;
+  }
+
+  async _executeChatSerial(sessionId, message, opts = {}) {
     await this.ensureConnected();
 
     // —— 0. 状态恢复：关闭可能残留的模态对话框 ——
@@ -211,7 +238,53 @@ class CDPController {
     // 启动 SSE 捕获（发送前开启监听，发送后 completion 请求到来即被捕获）
     const ssePromise = this.startSSECapture(sessionId, opts.onProgress, RESPONSE_TIMEOUT);
     this.captureArmed = true; // 武装：发送后第一个 API 请求兜底为 completion
-    await this.humanTypeAndSend(message);
+
+    // —— 0b. 确认模态拦截（消除「卡死等待用户确认」）——
+    // Qwen 在工具调用（ask_user_question 等）时会弹出原生确认框接管输入框：
+    //   此时主输入框 taLen=0 + 发送按钮 disabled，triggerSend 会把「空输入框」误判为发送成功
+    //   （st.empty 直接 return），导致 executeChat 以为发完了、傻等回复直到 RESPONSE_TIMEOUT 挂死。
+    //   这里在注入主输入框之前先检测：若确有确认模态，则尝试「填入并点击确认」通过确认框送达；
+    //   若无法处置，则明确抛错（不再静默挂死）并把模态 DOM 诊断写入 _captured_confirm_modal.json，
+    //   便于后续据真实样本完善处置逻辑。
+    //   ⚠ 结构性约束（2026-08-25 血案）：模态检测是**辅助**逻辑，绝不能阻断主发送链路。
+    //   上一版 detectConfirmModal 注入脚本语法错误直接向外抛，导致每个请求在发送前就失败、
+    //   服务端秒回错误（WorkBuddy 侧表现为 10000「请切换模型或重试」）。故这里整段兜底：
+    //   检测/处置一旦异常，一律降级为常规发送。
+    let modal = { present: false, strongModal: false };
+    try {
+      modal = await this.detectConfirmModal();
+    } catch (e) {
+      console.warn('[cdp] 确认模态检测失败(已忽略，按常规发送): ' + e.message);
+      modal = { present: false, strongModal: false };
+    }
+    if (modal.present) {
+      console.warn('[cdp] 检测到网页端确认模态(ask_user_question 等)，尝试通过确认框送达，避免误判发送成功而挂死');
+      let handled = null;
+      try {
+        handled = await this.answerConfirmModal(message);
+      } catch (e) {
+        handled = { ok: false, reason: 'inject-error:' + e.message };
+      }
+      if (handled && handled.ok) {
+        console.log('[cdp] 确认模态已自动处置(填入并点击确认)，继续等待回复');
+      } else if (modal.strongModal) {
+        // 确属强模态且处置失败：保留上一轮卡死修复——落盘诊断并明确抛错（不再静默挂死）
+        await this.dumpConfirmModal(modal, message);
+        this.captureArmed = false;
+        throw new Error(
+          'CONFIRM_MODAL_BLOCKED: 网页端弹出确认对话框，自动处置失败(' +
+          (handled && handled.reason ? handled.reason : 'unknown') +
+          ')。请在网页端手动确认，或将 _captured_confirm_modal.json 样本交给桥以便完善处置逻辑。'
+        );
+      } else {
+        // 非强模态（弱 overlay，可能是误判）：不致命，回退常规发送，避免「每次都误卡死」
+        console.warn('[cdp] 确认模态处置失败但非强模态，回退常规发送: ' + (handled && handled.reason));
+        await this.humanTypeAndSend(message);
+      }
+    } else {
+      await this.humanTypeAndSend(message);
+    }
+
     this.captureArmed = false;
     const sseContent = await ssePromise;
 
@@ -226,6 +299,58 @@ class CDPController {
     const domContent = await this.waitForNewReply(snap, RESPONSE_TIMEOUT, opts.onProgress);
     console.log(`[cdp] 会话 ${sessionId} 捕获到回复(DOM兜底, ${domContent.length}字)`);
     return { content: domContent };
+  }
+
+  // 检测网页端是否存在「确认模态」（ask_user_question 等原生对话框接管输入框）。
+  // 注入实现见模块级 pickModalCandidates / detectModalState（见文件底部）。
+  //
+  // 关键修复（2026-08-25 第二次回归）：原先写成 `(${this.detectModalState.toString()})(...)`，
+  //   而 detectModalState 曾是「类方法」，toString() 产出的是方法简写 `detectModalState(doc, win) {...}`，
+  //   包上括号后是 `(detectModalState(doc, win) { ... })` —— 在页面里必然
+  //   `SyntaxError: Unexpected token '{'`，导致每个请求在发送前就抛错 → 服务端秒回失败
+  //   → WorkBuddy 报 10000「请切换模型或重试」。现改为注入模块级函数声明再显式调用。
+  async detectConfirmModal() {
+    const src =
+      '(function () {\n' +
+      pickModalCandidates.toString() + '\n' +
+      detectModalState.toString() + '\n' +
+      'return detectModalState(document, window);\n' +
+      '})()';
+    const info = await this.evalJS(src, false);
+    return info || { present: false, strongModal: false };
+  }
+
+  // 尝试把 message 填入确认模态（若有输入区）并点击其「确认/确定/提交/发送」按钮，
+  // 通过确认框把工具结果回传给网页，而非注入被接管的主输入框（后者会触发 triggerSend 误判发送成功）。
+  // 返回 { ok, filled, reason }。
+  // 注意：必须与 detectConfirmModal 使用**同一套候选选取逻辑**（pickModalCandidates），
+  // 否则 detect 命中的是严格模态、answer 操作的却是另一个宽松浮层 —— 会填错框、点错按钮。
+  async answerConfirmModal(message) {
+    const msgJson = JSON.stringify(String(message == null ? '' : message));
+    const src =
+      '(function () {\n' +
+      'var msg = ' + msgJson + ';\n' +
+      pickModalCandidates.toString() + '\n' +
+      fillAndConfirmModal.toString() + '\n' +
+      'return fillAndConfirmModal(document, window, msg);\n' +
+      '})()';
+    return this.evalJS(src, false);
+  }
+
+  // 处置失败时把模态诊断信息落盘，便于据真实样本完善确认框处置逻辑。
+  async dumpConfirmModal(modal, message) {
+    try {
+      const fs = require('fs');
+      const dump = {
+        ts: new Date().toISOString(),
+        modal,
+        message: String(message || '').slice(0, 2000),
+      };
+      fs.writeFileSync('_captured_confirm_modal.json', JSON.stringify(dump, null, 2));
+      console.warn('[cdp] 已把确认模态诊断信息写入 _captured_confirm_modal.json');
+    } catch (e) {
+      console.warn('[cdp] dumpConfirmModal 失败: ' + e.message);
+    }
   }
 
   // 开启 SSE 捕获会话；返回 Promise<content|null>（超时返回 null 触发 DOM 兜底）
@@ -259,10 +384,12 @@ class CDPController {
     // 结束信号（多格式兼容，实测 Qwen v2 格式）：
     //   Qwen v2（实测 2026-08-21）：无 [DONE]/finish_reason，结束帧为
     //     {"delta":{"content":"","status":"finished","phase":"answer"}}
-    //   其他：OpenAI 兼容 finish_reason 帧 / [DONE] / event: close
+    //   其他：OpenAI 兼容 finish_reason 帧 / 独立行 [DONE] / 独立行 event: close
+    // 关键修复（2026-08-25）：[DONE]/event: close 必须按**独立行**匹配，
+    //   旧逻辑用裸 indexOf——answer 内容里出现 "[DONE]" 字样（如让模型输出该标记）会提前结算截断回复。
     if (
-      this.sseAccum.indexOf('[DONE]') !== -1 ||
-      this.sseAccum.indexOf('event: close') !== -1 ||
+      hasDoneMarker(this.sseAccum) ||
+      hasCloseMarker(this.sseAccum) ||
       sseStreamFinished(this.sseAccum)
     ) {
       this.finishSSE(answer);
@@ -776,6 +903,111 @@ function sleep(ms) {
 }
 
 // =====================================================================
+// 确认模态（ask_user_question 等）注入脚本
+//
+// 这些函数**不在 Node 里执行**，而是被 `.toString()` 注入到页面上下文运行，因此：
+//   1) 必须是**模块级函数声明**（不能是类方法/箭头属性）——否则 toString() 产出方法简写，
+//      拼进 `(...)` 后就是 `SyntaxError: Unexpected token '{'`（2026-08-25 踩过）。
+//   2) 内部只能用 ES5 风格 + 页面 API，不能引用 Node 作用域的任何变量（msg 由外层注入）。
+//   3) detect 与 answer 共用 pickModalCandidates，保证判定与操作是**同一个元素**。
+//
+// 判定策略（2026-08-25 收紧后）：只认「语义真模态」或「带全屏遮罩的 overlay」，
+// 且必须「有确认按钮」或「主输入框被接管」才算确认模态；普通 drawer/popup 一律放行常规发送。
+// =====================================================================
+
+// 选取确认模态候选。返回 { strong: [], cands: [], hasBackdrop: bool }
+function pickModalCandidates(doc, win) {
+  function visible(el) { return !!el && el.offsetParent !== null; }
+  function q(sel) { return Array.prototype.slice.call(doc.querySelectorAll(sel)); }
+  var strong = q('[role="dialog"], dialog[open], [aria-modal="true"]').filter(visible);
+  var overlay = q('[class*="modal"], [class*="overlay"], [class*="backdrop"], [class*="mask"]').filter(visible);
+  // 全屏遮罩探测：只扫 body 下浅层节点（浮层几乎都 portal 挂在 body 上），
+  // 避免 querySelectorAll('div') 全页遍历 + getComputedStyle 造成明显卡顿。
+  var shallow = q('body > div, body > div > div').slice(0, 300);
+  var hasBackdrop = shallow.some(function (el) {
+    if (!visible(el)) return false;
+    var s = win.getComputedStyle(el);
+    if (s.position !== 'fixed') return false;
+    if (s.visibility === 'hidden' || s.display === 'none') return false;
+    var r = el.getBoundingClientRect();
+    return r.width >= win.innerWidth * 0.9 && r.height >= win.innerHeight * 0.9;
+  });
+  return { strong: strong, cands: strong.concat(hasBackdrop ? overlay : []), hasBackdrop: hasBackdrop };
+}
+
+// 判定当前是否存在确认模态（纯读，不做任何点击）
+function detectModalState(doc, win) {
+  var picked = pickModalCandidates(doc, win);
+  if (!picked.cands.length) return { present: false, strongModal: false, hasBackdrop: picked.hasBackdrop };
+  var modal = picked.cands[0];
+  var btns = Array.prototype.slice.call(modal.querySelectorAll('button'));
+  function txt(b) { return ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).trim(); }
+  var confirmBtn = null;
+  for (var i = 0; i < btns.length; i++) {
+    if (/确认|确定|提交|发送|ok|yes|继续|confirm|agree|完成/i.test(txt(btns[i]))) { confirmBtn = btns[i]; break; }
+  }
+  var mainTa = doc.querySelector('[contenteditable="true"], textarea');
+  var mainInputBlocked = !mainTa || mainTa.offsetParent === null;
+  // 双重闸门：必须「有确认按钮」或「主输入框被接管」才算确认模态
+  var present = !!confirmBtn || mainInputBlocked;
+  return {
+    present: present,
+    strongModal: picked.strong.length > 0,
+    hasBackdrop: picked.hasBackdrop,
+    hasConfirmBtn: !!confirmBtn,
+    confirmBtnText: confirmBtn ? txt(confirmBtn) : null,
+    buttonTexts: btns.map(txt).filter(Boolean),
+    hasInput: !!modal.querySelector('textarea, [contenteditable="true"], input[type="text"]'),
+    mainInputBlocked: mainInputBlocked,
+    modalClass: (modal.className && modal.className.toString) ? modal.className.toString() : ''
+  };
+}
+
+// 把 msg 填入确认模态（若有输入区）并点击其「确认/确定/…」按钮。
+// 找不到真确认按钮时**绝不**退而点最后一个按钮（2026-08-25 踩过：会误点无关按钮并谎报成功）。
+function fillAndConfirmModal(doc, win, msg) {
+  var picked = pickModalCandidates(doc, win);
+  if (!picked.cands.length) return { ok: false, reason: 'no-modal' };
+  var modal = picked.cands[0];
+  var ta = modal.querySelector('textarea, [contenteditable="true"], input[type="text"]');
+  if (ta) {
+    try {
+      ta.focus();
+      // React 受控组件必须走原型链 value setter，否则内部 state 不更新；
+      // 但该路径可能因环境差异抛错 —— 此时降级为直接赋值，绝不能因填值失败就放弃点确认。
+      var filled = false;
+      try {
+        var proto = ta.tagName === 'TEXTAREA'
+          ? HTMLTextAreaElement.prototype
+          : (ta.tagName === 'INPUT' ? HTMLInputElement.prototype : null);
+        if (proto) {
+          Object.getOwnPropertyDescriptor(proto, 'value').set.call(ta, msg);
+          filled = true;
+        }
+      } catch (e0) { /* 降级处理 */ }
+      if (!filled) {
+        if (ta.tagName === 'TEXTAREA' || ta.tagName === 'INPUT') ta.value = msg;
+        else ta.innerText = msg;
+      }
+      if (typeof ta.dispatchEvent === 'function' && typeof Event === 'function') {
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        ta.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    } catch (e) { return { ok: false, reason: 'fill-failed:' + e.message }; }
+  }
+  var btns = Array.prototype.slice.call(modal.querySelectorAll('button'));
+  function txt(b) { return ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).trim(); }
+  for (var i = 0; i < btns.length; i++) {
+    if (/确认|确定|提交|发送|ok|yes|继续|confirm|agree|完成/i.test(txt(btns[i]))) {
+      if (btns[i].disabled) return { ok: false, reason: 'confirm-button-disabled' };
+      btns[i].click();
+      return { ok: true, filled: !!ta };
+    }
+  }
+  return { ok: false, reason: 'no-confirm-button' };
+}
+
+// =====================================================================
 // Qwen completion SSE 解析（多格式通用 + 快照/增量自适应）
 //
 // 实测/调研格式（2026-08）：
@@ -790,14 +1022,20 @@ function sleep(ms) {
 //
 // 提取规则（answer = 最终回答，自动排除 reasoning_content/思考）：
 //   1. 每帧提取候选文本（delta.content / message.content / output.text 等）
-//   2. 快照/增量自适应：候选比已累积长且以前缀包含 → 快照模式直接覆盖；
-//      候选与已累积无包含关系 → 增量模式追加
-//   3. 结束：finish_reason 非空(非 "null") 或 [DONE] 或 event: close
+//   2. **按流分组**：分组键 = response_id || id || '__single__'。
+//      关键（2026-08-25 血案）：真实 SSE 里 Qwen 的 answer 阶段是**增量式**——
+//      每帧 delta.content 只含新增片段，不是整段快照。若不做分组而直接对全部帧做
+//      "包含关系"判定，增量帧与已累积文本无包含关系 → 被忽略 → **客户端收到不完整回复**。
+//      分组后：同一流内 超集覆盖/相等忽略/前缀忽略/其余追加；
+//      不同流（新 response_id = 整段重放/新会话）→ 只保留最新流的累积，杜绝"双份回复"。
+//   3. 结束：finish_reason 非空(非 "null") 或 独立行 [DONE] / event: close
 // =====================================================================
 function parseCompletionSSE(body) {
   if (!body) return null;
-  let answer = '';
-  let thinking = ''; // 思考内容单独累积（供诊断/未来扩展，不混入回答）
+  let thinking = '';
+  let thinkingText = '';
+  const accByKey = new Map(); // 分组键 -> 该流已累积 answer
+  let lastKey = null;         // 最近一次出现内容的流（"当前流"）
 
   const blocks = body.split(/\n\s*\n/);
   for (const block of blocks) {
@@ -816,26 +1054,64 @@ function parseCompletionSSE(body) {
       }
       if (!j || typeof j !== 'object') continue;
 
+      const key = (j.response_id || j.id) || '__single__';
+      // 阶段判定：thinking/thinking_summary 等思考帧的 content **不得**进 answer。
+      // 血案（2026-08-25）：Qwen 思考阶段会在 delta.content 里放完整规划草稿
+      // （正文+工具块），answer 阶段再以增量式续写（只发工具块）。
+      // 若不按 phase 过滤，thinking 的"正文+块"与 answer 的"块"无包含关系 → 追加 →
+      // 客户端收到两份相同工具块（网页端却正常，因为页面只渲染 answer 阶段累积）。
+      const phase = (j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.phase) || '';
+      const isThinking = /thinking/i.test(String(phase));
       const { content, reasoning } = extractQwenTexts(j);
       if (reasoning) thinking += reasoning;
+      if (isThinking) {
+        // 思考阶段 content 不进 answer（防思考草稿/工具规划混入 → 重复工具块）。
+        // 但保留在 thinkingText 里供「answer 为空时回退」兜底。
+        if (content) thinkingText += content;
+        continue;
+      }
       if (!content) continue;
 
-      // 快照/增量自适应
-      if (!answer) {
-        answer = content;
-      } else if (content.length >= answer.length && content.startsWith(answer)) {
-        answer = content; // 快照模式：每帧都是完整回答的扩展
-      } else if (answer.startsWith(content)) {
-        // 快照前缀重复，忽略
-      } else {
-        answer += content; // 增量模式：逐帧追加
-      }
+      const cur = accByKey.get(key) || '';
+      accByKey.set(key, mergeStreamedText(cur, content));
+      lastKey = key;
     }
   }
-  if (thinking) {
-    console.log(`[cdp] 思考内容(SSE, ${thinking.length}字，已从回答中排除)`);
+  if (thinking || thinkingText) {
+    console.log(`[cdp] 思考内容(SSE, reasoning=${thinking.length}字, content=${thinkingText.length}字，已从回答中排除)`);
+  }
+  const answer = lastKey ? accByKey.get(lastKey) || '' : '';
+  if (!answer && thinkingText) {
+    // 兜底：answer 阶段完全没有 content（极端情况：Qwen 把全部正文放在思考阶段），
+    // 回退思考阶段文本，避免客户端空手。
+    console.warn(`[cdp] answer 阶段无内容，回退思考阶段文本(${thinkingText.length}字)`);
+    return thinkingText || null;
   }
   return answer || null;
+}
+
+// 把同一条流（同一 response_id/id）里的新帧 content 合并进该流已累积的 answer。
+// 设计目标（2026-08-25 二次修正）：既要根除「双份回复」，又**绝不丢增量帧**。
+//
+// 真实 Qwen 网页版 SSE 形态（实测样本）：
+//   - 思考阶段 thinking_summary：extra 里累积数组逐帧追加 —— 但 content 恒为空，不参与 answer；
+//   - 回答阶段 answer：delta.content 为**增量式**（短文本一帧全量，长文本分多帧，每帧只含新增片段）。
+//   因此对同一流内的帧：
+//     - content 与 answer 完全相同          → 重放帧，忽略
+//     - content 是 answer 的超集快照        → 覆盖（answer = content，兼容累积式增量/整段快照）
+//     - content 是 answer 的旧前缀片段      → 忽略（旧短帧重放）
+//     - content 是 answer 的**后缀**        → 忽略（跨阶段续写/已包含内容重放，防重复工具块）
+//     - 其余（纯增量新内容）               → **追加**（增量式流的正常形态，必须拼接，否则回复不完整）
+// 注：旧版这里写"一律忽略"，导致增量帧被丢弃 → 客户端收到不完整回复（2026-08-25 现场事故）。
+// 防翻倍的职责已上移到 parseCompletionSSE 的按流分组：不同流只保留最新一条，杜绝整段重放翻倍。
+function mergeStreamedText(answer, content) {
+  if (!content) return answer;
+  if (!answer) return content;
+  if (content === answer) return answer;                 // 完全相同：重放帧，忽略
+  if (content.startsWith(answer)) return content;        // 超集快照/累积式增量：覆盖
+  if (answer.startsWith(content)) return answer;         // 旧前缀片段：忽略
+  if (answer.endsWith(content)) return answer;           // 已包含的后缀续写：忽略（防重复）
+  return answer + content;                               // 纯增量帧：追加（绝不丢内容）
 }
 
 // 从单个 SSE JSON 帧中提取回答文本与思考文本。
@@ -883,6 +1159,17 @@ function extractQwenTexts(j) {
   if (typeof j.reasoning_content === 'string') reasoning += j.reasoning_content;
 
   return { content, reasoning };
+}
+
+// [DONE] / event: close 必须作为**独立行**才算结束信号，
+// 否则 answer 内容里出现 "[DONE]" 字样（如用户要求模型输出该标记）会提前结算截断回复。
+function hasDoneMarker(body) {
+  if (!body) return false;
+  return body.split('\n').some((l) => l.trim() === 'data: [DONE]');
+}
+function hasCloseMarker(body) {
+  if (!body) return false;
+  return body.split('\n').some((l) => l.trim() === 'event: close');
 }
 
 // 检测 SSE 原文中是否出现流式结束信号。
@@ -959,3 +1246,10 @@ module.exports.parseCompletionSSE = parseCompletionSSE;
 module.exports.extractQwenTexts = extractQwenTexts;
 module.exports.sseStreamFinished = sseStreamFinished;
 module.exports.sseHasFinishReason = sseStreamFinished; // 旧名兼容
+module.exports.mergeStreamedText = mergeStreamedText;
+module.exports.hasDoneMarker = hasDoneMarker;
+module.exports.hasCloseMarker = hasCloseMarker;
+// 导出注入脚本函数便于 mock-DOM 单测（它们运行在页面上下文，必须保持模块级函数声明）
+module.exports.pickModalCandidates = pickModalCandidates;
+module.exports.detectModalState = detectModalState;
+module.exports.fillAndConfirmModal = fillAndConfirmModal;

@@ -1,0 +1,14 @@
+{
+  "ts": "2026-08-25T02:40:01.999Z",
+  "modal": {
+    "present": true,
+    "hasConfirmBtn": false,
+    "confirmBtnText": null,
+    "buttonTexts": [],
+    "hasInput": false,
+    "mainInputBlocked": false,
+    "sendDisabled": true,
+    "modalClass": "chat-extension-modal"
+  },
+  "message": "你具备调用外部工具的能力。当需要调用工具时，请严格按以下 XML 格式输出\n（不要加代码围栏、不要在工具调用块之外写多余的解释性文字）：\n\n<|DSML|tool_calls>\n  <|DSML|invoke name=\"工具名\">\n    <|DSML|parameter name=\"参数名\"><![CDATA[参数值]]></<|DSML|parameter>\n  </<|DSML|invoke>\n</<|DSML|tool_calls>\n\n规则：\n- 用 <|DSML|tool_calls> 包裹，内部可含一个或多个 <|DSML|invoke>；\n- 工具名写在 invoke 的 name 属性里；\n- 字符串参数值必须放在 <![CDATA[ ... ]]> 中；数字/布尔/null 直接写纯文本；\n- 工具调用块之前或之后可写自然语言说明（会作为普通回复一并返回）；\n- 不要把工具调用包在 ``` 代码围栏里，不要重复说明格式。\n- 结束标签形如 </|DSML|parameter>（只有一对尖括号）；严禁写成 </<|DSML|parameter>（多了一个 <），否则工具调用会解析失败。\n\n可用工具：\n- present_files: Present files and previews to the user as the final result of a task. This is the single entry point for showing results. Call this after producing files the user should view, inspect, or download. Pass all related items together; the order expresses viewing priority — put the item the user should see first at the beginning. The first item is automatically opened/focused for the user. Each entry can be either an absolute local file path or an http/https URL:  参数[files:array(必填), cwd:string(可选), explanation:string(可选)]\n- automation_update: List, view, create, update, or delete scheduled automations. Use mode \"list\" to list all automations (summary only), \"view\" to fetch a single automation's full editable configuration by id, \"create\" to create a new automation (requires full fields), \"update\" to modify an existing one (only id is required; unspecified fields are preserved), or \"delete\" to remove an automation by id. Deletion takes effect immediately as a soft delete; the row is hidden from list/view but kept in storage and can be restored by support tools.  参数[mode:string(必填), id:string(可选), name:string(可选), prompt:string(可选), scheduleType:string(可选), rrule:string(可选), scheduledAt:string(可选), cwds:string(可选), status:string(可选), validFrom:string(可选), validUntil:string(可选), expertId:string(可选), expertMarketplace:string(可选), connectorIds:array(可选)]\n- read_me: Returns required context for show_widget (CSS variables, colors, typography, layout rul"
+}
