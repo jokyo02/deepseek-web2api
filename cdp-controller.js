@@ -192,8 +192,10 @@ class CDPController {
       this.activeSSE.onProgress(answer);
       this.sseLastAnswer = answer;
     }
-    // 结束信号：FINISHED（status 或 quasi_status）或 event: close
-    if (this.sseAccum.indexOf('FINISHED') !== -1 || this.sseAccum.indexOf('event: close') !== -1) {
+    // 结束信号：FINISHED 状态帧（逐行解析 JSON 判定）或独立行 event: close
+    // 关键修复（2026-08-25）：旧逻辑裸 indexOf('FINISHED')——回答内容里出现 "FINISHED"
+    // 字样会提前结算截断回复。
+    if (sseStreamFinishedDs(this.sseAccum) || hasCloseLine(this.sseAccum)) {
       this.finishSSE(answer);
     }
   }
@@ -611,12 +613,17 @@ function sleep(ms) {
 //   data: {"v":"字符增量"}      ← RESPONSE 分片创建后的 v 字符串为回答增量
 //   data: {"p":"response/status","o":"SET","v":"FINISHED"}   /   event: close
 // 提取规则：RESPONSE 分片创建后的所有字符串 v 增量拼接 = 最终回答（自动排除 THINK 思考内容）。
+// 2026-08-25 移植自 qwen-cdp 的防重复修复：
+//   - 分片创建帧（response/fragments APPEND）**按分片 id 去重**——页面重发同一分片创建帧时，
+//     初始 content 只拼接一次（旧实现无脑 `answer += f.content`，重发会翻倍）；
+//   - 快照帧相同内容去重（snapshots 只保留不同内容，避免重复快照干扰"取最长"）。
 // =====================================================================
 function parseCompletionSSE(body) {
   if (!body) return null;
   let answer = '';
   let inResponse = false;
   const snapshots = []; // 快照帧中的 RESPONSE content（取最长作保险）
+  const seenFragmentIds = new Set(); // 已拼接过的 RESPONSE 分片 id（防分片创建帧重发翻倍）
 
   const blocks = body.split(/\n\s*\n/);
   for (const block of blocks) {
@@ -641,15 +648,20 @@ function parseCompletionSSE(body) {
           .filter((f) => f && f.type === 'RESPONSE' && typeof f.content === 'string')
           .map((f) => f.content)
           .join('');
-        if (respFrag) snapshots.push(respFrag);
+        if (respFrag && !snapshots.includes(respFrag)) snapshots.push(respFrag);
         continue;
       }
 
-      // RESPONSE 分片创建：标记进入回答段，并拼上初始 content
+      // RESPONSE 分片创建：标记进入回答段，并拼上初始 content（按分片 id 去重）
       if (j.p === 'response/fragments' && j.o === 'APPEND' && Array.isArray(j.v)) {
         for (const f of j.v) {
           if (f && f.type === 'RESPONSE' && typeof f.content === 'string') {
             inResponse = true;
+            if (f.id != null) {
+              const k = String(f.id);
+              if (seenFragmentIds.has(k)) continue;
+              seenFragmentIds.add(k);
+            }
             answer += f.content;
           }
         }
@@ -671,6 +683,35 @@ function parseCompletionSSE(body) {
   return answer || null;
 }
 
+// 结束信号：DeepSeek 格式响应结束 = {"p":"response/status","o":"SET","v":"FINISHED"}（含 /status/ 变体）。
+// 关键修复（2026-08-25 移植自 qwen-cdp）：旧逻辑裸 indexOf('FINISHED')——回答内容里出现
+// "FINISHED" 字样（如模型输出该英文词）会提前结算截断回复。改为逐行解析 JSON 判定状态帧。
+function sseStreamFinishedDs(body) {
+  if (!body) return false;
+  const lines = body.split('\n');
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t.startsWith('data:')) continue;
+    const d = t.slice(5).trim();
+    if (!d || d === '[DONE]') continue;
+    try {
+      const j = JSON.parse(d);
+      if (j && j.p && /status/i.test(String(j.p)) && j.o === 'SET' && j.v === 'FINISHED') return true;
+    } catch (_) {
+      // 非 JSON 行忽略
+    }
+  }
+  return false;
+}
+
+// event: close 必须作为**独立行**才算结束信号（内容里的字样不算）
+function hasCloseLine(body) {
+  if (!body) return false;
+  return body.split('\n').some((l) => l.trim() === 'event: close');
+}
+
 module.exports = new CDPController();
 // 导出解析函数便于单测
 module.exports.parseCompletionSSE = parseCompletionSSE;
+module.exports.sseStreamFinishedDs = sseStreamFinishedDs;
+module.exports.hasCloseLine = hasCloseLine;
