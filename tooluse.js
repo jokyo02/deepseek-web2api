@@ -264,14 +264,30 @@ function stripDsmlMarkup(text) {
 }
 
 // 解析 <parameter> 内部：优先 JSON，失败则自动类型转换
+// 2026-08-25 加固：JSON.parse 失败后依次尝试「修复裸换行」→「salvageJSON（含数组）」
+// → autoType，杜绝"数组参数被降级成字符串"（WorkBuddy 报 expected array, received string）。
 function parseParameterValue(raw) {
   let v = raw.trim();
   if (v.startsWith(CDATA_OPEN) && v.endsWith(CDATA_CLOSE)) {
     v = v.slice(CDATA_OPEN.length, -CDATA_CLOSE.length);
+  } else if (v.includes(CDATA_OPEN)) {
+    // CDATA 未正确闭合（尾部有杂讯/换行）：从 <![CDATA[ 后提取到最后一个 ]]>
+    const s = v.indexOf(CDATA_OPEN);
+    const e = v.lastIndexOf(CDATA_CLOSE);
+    if (s >= 0 && e > s) v = v.slice(s + CDATA_OPEN.length, e);
   }
   try {
     return JSON.parse(v);
   } catch (_) {
+    // 1) 字符串值裸换行修复（模型跨行 JSON 常见）
+    const repaired = repairJSONStrings(v);
+    if (repaired !== v) {
+      try { return JSON.parse(repaired); } catch (_) {}
+    }
+    // 2) 提取最外层数组/对象 + 修尾逗号
+    const salvaged = salvageJSON(v);
+    if (salvaged !== null) return salvaged;
+    // 3) 兜底自动类型（数组/对象字面量文本保持原样，避免被 autoType 误转换）
     return autoType(v);
   }
 }
@@ -405,19 +421,42 @@ function extractLegacyToolCalls(content) {
   return calls;
 }
 
-// 尽力解析一段可能为 JSON 的文本：直接解析 → 裁剪最外层 {} → 去除尾逗号重试
+// 尽力解析一段可能为 JSON 的文本：直接解析 → 裁剪最外层 {} 或 [] → 去除尾逗号重试
+// 2026-08-25 加固：原实现只提取最外层 {...}，参数值为数组字面量（如 questions: [...]）时
+// 提取不到 → JSON.parse 失败 → 降级成字符串 → WorkBuddy 报 "questions expected array, received string"。
 function salvageJSON(raw) {
   if (typeof raw !== 'string') return null;
   const s = raw.trim();
   try { return JSON.parse(s); } catch (_) {}
-  const a = s.indexOf('{');
-  const b = s.lastIndexOf('}');
+  // 数组优先（参数值多为数组字面量），其次对象
+  const a = s.indexOf('[');
+  const b = s.lastIndexOf(']');
   if (a !== -1 && b > a) {
     const sub = s.slice(a, b + 1);
     try { return JSON.parse(sub); } catch (_) {}
     try { return JSON.parse(sub.replace(/,(\s*[}\]])/g, '$1')); } catch (_) {}
   }
+  const ao = s.indexOf('{');
+  const bo = s.lastIndexOf('}');
+  if (ao !== -1 && bo > ao) {
+    const sub = s.slice(ao, bo + 1);
+    try { return JSON.parse(sub); } catch (_) {}
+    try { return JSON.parse(sub.replace(/,(\s*[}\]])/g, '$1')); } catch (_) {}
+  }
   return null;
+}
+
+// 修复 JSON 字符串值里的裸换行/制表符（模型常见输出：JSON 值跨行但没转义 \n，JSON.parse 直接失败）。
+// 只处理字符串字面量内部，不动结构字符。
+function repairJSONStrings(v) {
+  if (typeof v !== 'string' || !v) return v;
+  let t = v.replace(/"((?:\\.|[^"\\])*)"/g, (m, inner) => {
+    return '"' + inner
+      .replace(/\n/g, '\\n')
+      .replace(/\r/g, '\\r')
+      .replace(/\t/g, '\\t') + '"';
+  });
+  try { JSON.parse(t); return t; } catch (_) { return v; }
 }
 
 // 去除正文里的旧版定界符残留（旧格式调用块之间的正文）
