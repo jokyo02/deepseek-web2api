@@ -345,6 +345,24 @@ function sendNewTopicAck(res, model, sessionId, stream) {
 function buildToolCallCompletion(model, sessionId, calls, text) {
   const created = Math.floor(Date.now() / 1000);
   const content = typeof text === 'string' ? text : '';
+  // 诊断日志（2026-08-25）：发出前检查每个 tool_calls 的参数类型，便于复现
+  // "questions expected array, received string" 类问题时从日志定位真实参数形态。
+  if (Array.isArray(calls) && calls.length) {
+    for (const c of calls) {
+      try {
+        const raw = (c.function && c.function.arguments) || '';
+        const parsed = JSON.parse(raw);
+        const summary = {};
+        for (const k of Object.keys(parsed)) {
+          const val = parsed[k];
+          summary[k] = Array.isArray(val) ? 'array(' + val.length + ')' : (val === null ? 'null' : typeof val);
+        }
+        console.log(`[api] tool_calls → ${c.function.name} 参数类型: ${JSON.stringify(summary)}`);
+      } catch (e) {
+        console.warn(`[api] tool_calls ${c.function.name} 参数 JSON 解析失败: ${e.message.slice(0, 80)}`);
+      }
+    }
+  }
   return {
     id: `chatcmpl-${sessionId}`,
     object: 'chat.completion',
@@ -467,6 +485,19 @@ function emitSieveEvents(res, model, chatId, created, events, state) {
       );
     } else if (ev.type === 'tool_calls' && ev.data && ev.data.length) {
       state.hasToolCalls = true;
+      // 诊断日志（2026-08-25）：流式发出前检查参数类型（与 buildToolCallCompletion 一致）
+      try {
+        const c0 = ev.data[0];
+        const parsed = JSON.parse((c0.function && c0.function.arguments) || '{}');
+        const summary = {};
+        for (const k of Object.keys(parsed)) {
+          const val = parsed[k];
+          summary[k] = Array.isArray(val) ? 'array(' + val.length + ')' : (val === null ? 'null' : typeof val);
+        }
+        console.log(`[api] sieve → ${c0.function.name} 参数类型: ${JSON.stringify(summary)}`);
+      } catch (e) {
+        console.warn(`[api] sieve tool_calls 参数 JSON 解析失败: ${e.message.slice(0, 80)}`);
+      }
       ev.data.forEach((c, i) => {
         res.write(
           `data: ${JSON.stringify({
