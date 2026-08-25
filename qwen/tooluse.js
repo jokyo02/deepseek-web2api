@@ -122,7 +122,7 @@ function buildToolInstruction(tools, toolChoice) {
   const toolList = (tools || []).map(formatToolBrief).join('\n');
 
   const formatRules = [
-    '你具备调用外部工具的能力。当需要调用工具时，请严格按以下 XML 格式输出',
+    '你具备调用外部工具的能力，优先考虑使用工具推进工作任务。当需要调用工具时，请严格按以下 XML 格式输出',
     '（不要加代码围栏、不要在工具调用块之外写多余的解释性文字）：',
     '',
     `${DSML_MARK}tool_calls>`,
@@ -565,9 +565,17 @@ class ToolStreamSieve {
     const closeTool = `</|DSML|tool_calls>`;       // </|DSML|tool_calls>
     const openInvoke = `${DSML_MARK}invoke `;      // <|DSML|invoke 
     const closeInvoke = `</|DSML|invoke>`;         // </|DSML|invoke>
-    if (buf.includes(openTool) || buf.includes('<tool_calls>')) {
-      return buf.includes(closeTool) || buf.includes('</tool_calls>');
-    }
+    // 外层 <tool_calls> 存在时，必须**外层闭合**才算完成——只闭合 invoke 不算。
+    // 关键修复（2026-08-25，deepseek 移植回修）：旧逻辑里 invoke 闭合即判定完成，小分片流
+    // 下 `</|DSML|invoke>` 先于 `</|DSML|tool_calls>` 到达，残缺块被「裸 invoke」分支解析出
+    // 调用，外层闭合尾巴被当正文吐出。且 _splitSafe 可能把 `<` 单独吐掉、捕获区以
+    // 「缺 `<` 的开标签」开头——外层开标签检测必须用 startsWith 覆盖缺 `<` 变体。
+    const hasOuterOpen =
+      buf.startsWith(openTool) || buf.startsWith('<tool_calls>') ||
+      buf.startsWith('|DSML|tool_calls>') || buf.startsWith('|TOOLSXML|tool_calls>');
+    const hasOuterClose = buf.includes(closeTool) || buf.includes('</tool_calls>');
+    if (hasOuterOpen) return hasOuterClose;
+    // 无外层包裹：裸 <invoke> 闭合即可
     if (buf.includes(openInvoke) || buf.includes('<invoke ')) {
       return buf.includes(closeInvoke) || buf.includes('</invoke>');
     }
@@ -608,7 +616,11 @@ class ToolStreamSieve {
     if (!text) return ['', ''];
     const lastLt = text.lastIndexOf('<');
     const lastPipe = text.lastIndexOf('|');
-    const lastSpecial = lastLt >= lastPipe ? lastLt : lastPipe;
+    // 关键修复（2026-08-25，deepseek 移植回修）：优先按 `<` 切分（标签以 `<` 开头）。
+    // 旧逻辑 `lastLt >= lastPipe ? lastLt : lastPipe` 在「<|」同时存在时取 `|`（索引更大），
+    // 把 `<` 留在 safe 里吐出 → 块开标签 `<|DSML|tool_calls>` 的 `<` 丢失 →
+    // 捕获区以缺 `<` 的标签开头 → cleanDsmlText 清不干净 → DSML 原文混入正文。
+    const lastSpecial = lastLt >= 0 ? lastLt : lastPipe;
     if (lastSpecial === -1) return [text, ''];
     const tail = text.slice(lastSpecial);
     if (!tail) return [text, ''];
