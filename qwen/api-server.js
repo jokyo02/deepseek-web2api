@@ -308,6 +308,25 @@ function buildCompletion(model, sessionId, prompt, content) {
   };
 }
 
+// =====================================================================
+// SSE 心跳保活（2026-08-25）
+// 网页端回复量大又慢（深度思考阶段可能几十秒无文本增量），而 SSE 连接
+// 空闲超过 30~60 秒时，中间代理（Nginx/企业网关）或客户端会掐断连接，
+// 表现为「网页端还在生成，客户端却已超时断开 / 报 10000 无响应」。
+// 方案：定时发送 SSE 注释帧（": keep-alive"）——标准 EventSource 忽略
+// 注释行（不触发 message 事件），仅用于维持 TCP/HTTP 连接活跃；配合
+// 响应头 X-Accel-Buffering: no 禁用 Nginx 等代理的响应缓冲（否则代理
+// 会把整个 SSE 缓冲到响应结束才转发，SSE 增量形同虚设）。
+// =====================================================================
+function startSSEKeepAlive(res, intervalMs = 15000) {
+  const timer = setInterval(() => {
+    if (res.writableEnded || res.destroyed) { clearInterval(timer); return; }
+    try { res.write(': keep-alive\n\n'); } catch (_) { clearInterval(timer); }
+  }, Math.max(1000, intervalMs));
+  res.once('close', () => clearInterval(timer));
+  return timer;
+}
+
 // NEW.TOPIC 控制指令的确认响应：桥接层已入队新建网页会话（fire-and-forget），
 // 这里回一个 OpenAI 标准完成（或 SSE），正文回显 "NEW.TOPIC"，客户端据此确认指令已受理。
 function sendNewTopicAck(res, model, sessionId, stream) {
@@ -319,7 +338,9 @@ function sendNewTopicAck(res, model, sessionId, stream) {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
     });
+    startSSEKeepAlive(res);
     res.write(
       `data: ${JSON.stringify({
         id: chatId, object: 'chat.completion.chunk', created, model,
@@ -391,7 +412,9 @@ async function streamContent(res, model, sessionId, content) {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
+  startSSEKeepAlive(res);
   res.write(
     `data: ${JSON.stringify({
       id: chatId, object: 'chat.completion.chunk', created, model,
@@ -428,7 +451,9 @@ async function streamToolMode(res, model, sessionId, message, opts) {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
+  startSSEKeepAlive(res);
 
   // 首个 chunk：声明 assistant 角色
   res.write(
@@ -532,7 +557,9 @@ async function handleStreaming(req, res, { model, sessionId, message, opts }) {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
+  startSSEKeepAlive(res);
 
   // 首个 chunk：声明 assistant 角色
   res.write(
